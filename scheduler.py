@@ -7,7 +7,7 @@ context.bot.send_message -- no thread bridging needed.
 
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 
 from telegram.ext import ContextTypes, JobQueue
@@ -44,6 +44,20 @@ def format_utc_iso(dt: datetime) -> str:
     string used everywhere in the database, regardless of the input's tzinfo.
     """
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def compute_week_number(anchor_date: date, target_date: date) -> int | None:
+    """Semester week number of target_date given week 1 starts on anchor_date.
+
+    Weeks are 7-day blocks counted from the anchor (day 0 -> week 1). Returns
+    None if target_date is before the anchor or past week 13 (outside the
+    13-week semester), so callers can distinguish "no such week" from a real
+    week number rather than clamping silently.
+    """
+    if target_date < anchor_date:
+        return None
+    wk = ((target_date - anchor_date).days // 7) + 1
+    return wk if wk <= 13 else None
 
 
 def schedule_reminder(

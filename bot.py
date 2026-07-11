@@ -30,6 +30,8 @@ logger = logging.getLogger(__name__)
 
 BOT_COMMANDS = [
     BotCommand("menu", "Show the quick-access menu"),
+    BotCommand("today", "Today's classes, tasks and reminders"),
+    BotCommand("week", "This week's timetable"),
     BotCommand("tasks", "View and update your tasks"),
     BotCommand("reminders", "View and cancel upcoming reminders"),
     BotCommand("topics", "Browse your topics and notes"),
@@ -96,6 +98,8 @@ def main() -> None:
     )
 
     application.add_handler(CommandHandler("start", start_handler))
+    application.add_handler(CommandHandler("today", commands.today_command))
+    application.add_handler(CommandHandler("week", commands.week_command))
     application.add_handler(CommandHandler("tasks", commands.tasks_command))
     application.add_handler(CommandHandler("reminders", commands.reminders_command))
     application.add_handler(CommandHandler("topics", commands.topics_command))

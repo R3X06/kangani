@@ -113,6 +113,11 @@ CREATE TABLE IF NOT EXISTS reminders (
     CHECK (linked_task_id IS NULL OR linked_event_id IS NULL)
 );
 
+CREATE TABLE IF NOT EXISTS chat_settings (
+    chat_id                   INTEGER PRIMARY KEY,
+    semester_week1_start_date TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_chat_status     ON tasks(chat_id, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_deadline        ON tasks(deadline);
 CREATE INDEX IF NOT EXISTS idx_tasks_event           ON tasks(event_id);
@@ -129,8 +134,33 @@ CREATE INDEX IF NOT EXISTS idx_reminders_chat_status ON reminders(chat_id, statu
 _SCHEMA_VERSION = 2
 _ALL_TABLES = [
     "reminders", "progress_logs", "notes", "schedule_blocks",
-    "tasks", "topics", "events", "modules",
+    "tasks", "topics", "events", "modules", "chat_settings",
 ]
+
+# Valid schedule_block.week_pattern values (besides an explicit week-number list):
+_FIXED_WEEK_PATTERNS = ("every", "odd", "even")
+_MAX_SEMESTER_WEEK = 13
+
+
+def _validate_week_pattern(week_pattern: str) -> str:
+    """Validate and normalize a schedule_block week_pattern.
+
+    Accepts 'every', 'odd', 'even', or a comma-separated list of week numbers
+    each in 1.._MAX_SEMESTER_WEEK (e.g. '1,3,5,7,9,11,13'). Returns the
+    canonical form (list normalized to comma-joined ints, no spaces); raises
+    ValueError on anything else so a malformed pattern never reaches the DB.
+    """
+    if week_pattern in _FIXED_WEEK_PATTERNS:
+        return week_pattern
+    parts = [p.strip() for p in week_pattern.split(",")]
+    if not parts or not all(
+        p.isdigit() and 1 <= int(p) <= _MAX_SEMESTER_WEEK for p in parts
+    ):
+        raise ValueError(
+            "week_pattern must be 'every', 'odd', 'even', or a comma-separated "
+            f"list of week numbers 1-{_MAX_SEMESTER_WEEK}, got {week_pattern!r}"
+        )
+    return ",".join(str(int(p)) for p in parts)
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, decl: str) -> None:
@@ -179,6 +209,9 @@ def init_db() -> None:
         # without touching its rows, so they must NOT be gated behind the
         # drop-and-recreate _SCHEMA_VERSION bump above.
         _ensure_column(conn, "schedule_blocks", "class_type", "TEXT")
+        _ensure_column(
+            conn, "schedule_blocks", "week_pattern", "TEXT NOT NULL DEFAULT 'every'"
+        )
         conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
         conn.commit()
     finally:
@@ -784,6 +817,7 @@ def create_schedule_block(
     module_name: str | None = None,
     class_type: str | None = None,
     location: str | None = None,
+    week_pattern: str = "every",
 ) -> dict:
     if (day_of_week is None) == (specific_date is None):
         raise ValueError(
@@ -801,16 +835,17 @@ def create_schedule_block(
             raise ValueError(
                 f"specific_date must be an ISO-8601 date YYYY-MM-DD, got {specific_date!r}"
             ) from None
+    week_pattern = _validate_week_pattern(week_pattern)
 
     module_id = get_or_create_module(chat_id, module_name)["id"] if module_name else None
     conn = get_connection()
     try:
         cur = conn.execute(
             "INSERT INTO schedule_blocks (chat_id, module_id, day_of_week, "
-            "specific_date, start_time, end_time, class_type, location) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "specific_date, start_time, end_time, class_type, location, week_pattern) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (chat_id, module_id, day_of_week, specific_date, start_time,
-             end_time, class_type, location),
+             end_time, class_type, location, week_pattern),
         )
         conn.commit()
         row = conn.execute(
@@ -871,5 +906,45 @@ def delete_schedule_block(chat_id: int, schedule_block_id: int) -> dict | None:
         )
         conn.commit()
         return dict(row)
+    finally:
+        conn.close()
+
+
+# --- chat settings (semester anchor) -----------------------------------
+
+def set_semester_anchor(chat_id: int, start_date: str) -> str:
+    """Upsert the single chat_settings row holding the semester week-1 anchor.
+
+    start_date is a plain YYYY-MM-DD calendar date (the first day / Monday of
+    week 1), validated here. Idempotent -- calling again just overwrites it.
+    """
+    try:
+        date.fromisoformat(start_date)
+    except ValueError:
+        raise ValueError(
+            f"start_date must be an ISO-8601 date YYYY-MM-DD, got {start_date!r}"
+        ) from None
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO chat_settings (chat_id, semester_week1_start_date) "
+            "VALUES (?, ?) ON CONFLICT(chat_id) DO UPDATE SET "
+            "semester_week1_start_date = excluded.semester_week1_start_date",
+            (chat_id, start_date),
+        )
+        conn.commit()
+        return start_date
+    finally:
+        conn.close()
+
+
+def get_semester_anchor(chat_id: int) -> str | None:
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT semester_week1_start_date FROM chat_settings WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+        return row["semester_week1_start_date"] if row else None
     finally:
         conn.close()

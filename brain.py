@@ -90,6 +90,19 @@ they explicitly ask for something else (e.g. "the next 7 days"). Before \
 calling delete_schedule_block, call query_schedule first to find the \
 correct schedule_block_id -- never guess it.
 
+Some classes don't run every week -- they alternate (odd/even weeks) or run \
+on specific weeks. To handle this, each chat has ONE semester anchor: the \
+calendar date week 1 begins (its Monday). From that single date Kangani \
+derives which semester week any date falls in. Set or update it with \
+set_semester_start when the user tells you the start date (e.g. "week 1 \
+starts August 13th"). When creating a recurring schedule block that does NOT \
+run every week, set create_schedule_block's week_pattern ('odd', 'even', or \
+an explicit list like '2,4,6,8,10,12'); leave it as the default 'every' \
+otherwise. A non-'every' pattern cannot be resolved without the anchor, so \
+if the user asks for an alternating/specific-week class and no semester start \
+date is set yet, ask them for it ONCE (which date is week 1?) before creating \
+the block -- don't ask repeatedly once it's set.
+
 A task or topic attaches to EITHER a module OR an event, never both. Use a \
 module for a recurring academic subject (Machine Learning, Physics); use an \
 event for a time-boxed activity that needs its own tasks/notes but isn't a \

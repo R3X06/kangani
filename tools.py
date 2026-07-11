@@ -11,6 +11,17 @@ import scheduler
 
 logger = logging.getLogger(__name__)
 
+ANCHOR_NOT_SET_MESSAGE = (
+    "Set your semester start date first — tell me which date week 1 begins."
+)
+
+
+class AnchorNotSetError(Exception):
+    """Raised when a non-'every' schedule block must be resolved to a semester
+    week but no anchor is set for the chat yet -- so we surface a clear prompt
+    instead of silently showing or hiding the block."""
+
+
 TOOL_SCHEMAS = [
     {
         "name": "create_task",
@@ -405,6 +416,20 @@ TOOL_SCHEMAS = [
                     "type": "string",
                     "description": "Optional room/location.",
                 },
+                "week_pattern": {
+                    "type": "string",
+                    "description": (
+                        "Which semester weeks this recurring class actually "
+                        "runs. Defaults to 'every' (every week). Use 'odd' or "
+                        "'even' for classes that alternate by week parity, or "
+                        "an explicit comma-separated list of week numbers "
+                        "(e.g. '2,4,6,8,10,12') for anything else. Only "
+                        "meaningful with day_of_week; leave as 'every' for "
+                        "one-off (specific_date) blocks. Non-'every' patterns "
+                        "require the chat's semester start date to be set "
+                        "first via set_semester_start."
+                    ),
+                },
             },
             "required": ["start_time", "end_time"],
         },
@@ -453,6 +478,32 @@ TOOL_SCHEMAS = [
             "type": "object",
             "properties": {"schedule_block_id": {"type": "integer"}},
             "required": ["schedule_block_id"],
+        },
+    },
+    {
+        "name": "set_semester_start",
+        "description": (
+            "Set (or update) the calendar date that semester week 1 begins "
+            "for this chat -- the single anchor Kangani uses to compute which "
+            "semester week any date falls in, so alternating classes (odd/even "
+            "weeks, or specific week lists) resolve correctly. Call this when "
+            "the user tells you the start date (e.g. 'week 1 starts August "
+            "13th', 'the week of Aug 13 is week 1'). Pass the FIRST DAY "
+            "(Monday) of week 1. Idempotent -- calling again just updates the "
+            "anchor."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "start_date": {
+                    "type": "string",
+                    "description": (
+                        "ISO-8601 date YYYY-MM-DD -- the Monday that semester "
+                        "week 1 begins."
+                    ),
+                },
+            },
+            "required": ["start_date"],
         },
     },
 ]
@@ -728,19 +779,51 @@ _WEEKDAY_CODES = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
 _MAX_SCHEDULE_QUERY_DAYS = 90
 
 
-def _expand_occurrences(blocks: list[dict], date_from: str, date_to: str) -> list[dict]:
+def _week_matches(week_pattern: str, week_number: int) -> bool:
+    """Whether a resolved semester week number satisfies a block's week_pattern.
+    Assumes week_pattern is already valid (validated at create time)."""
+    if week_pattern == "every":
+        return True
+    if week_pattern == "odd":
+        return week_number % 2 == 1
+    if week_pattern == "even":
+        return week_number % 2 == 0
+    return week_number in {int(p) for p in week_pattern.split(",")}
+
+
+def _expand_occurrences(
+    blocks: list[dict], date_from: str, date_to: str, chat_id: int
+) -> list[dict]:
     d_from = date.fromisoformat(date_from)
     d_to = date.fromisoformat(date_to)
+
+    # Resolve the semester anchor once. Blocks with the default 'every' pattern
+    # never need it; a non-'every' block with no anchor set is unresolvable, so
+    # we raise rather than guess whether it runs this week.
+    anchor_str = database.get_semester_anchor(chat_id)
+    anchor_date = date.fromisoformat(anchor_str) if anchor_str else None
+
+    def _keep(candidate_date: date, block: dict) -> bool:
+        pattern = block.get("week_pattern") or "every"
+        if pattern == "every":
+            return True
+        if anchor_date is None:
+            raise AnchorNotSetError(ANCHOR_NOT_SET_MESSAGE)
+        wk = scheduler.compute_week_number(anchor_date, candidate_date)
+        if wk is None:  # outside the semester -> the class doesn't run
+            return False
+        return _week_matches(pattern, wk)
+
     occurrences = []
     for block in blocks:
         if block["specific_date"] is not None:
             block_date = date.fromisoformat(block["specific_date"])
-            if d_from <= block_date <= d_to:
+            if d_from <= block_date <= d_to and _keep(block_date, block):
                 occurrences.append({**block, "occurrence_date": block["specific_date"]})
         else:
             d = d_from
             while d <= d_to:
-                if _WEEKDAY_CODES[d.weekday()] == block["day_of_week"]:
+                if _WEEKDAY_CODES[d.weekday()] == block["day_of_week"] and _keep(d, block):
                     occurrences.append({**block, "occurrence_date": d.isoformat()})
                 d += timedelta(days=1)
     occurrences.sort(key=lambda o: (o["occurrence_date"], o["start_time"]))
@@ -757,14 +840,20 @@ def _handle_create_schedule_block(tool_input: dict, chat_id: int, job_queue) -> 
         module_name=tool_input.get("module_name"),
         class_type=tool_input.get("class_type"),
         location=tool_input.get("location"),
+        week_pattern=tool_input.get("week_pattern", "every"),
     )
     when = block["day_of_week"] if block["day_of_week"] else block["specific_date"]
     module_part = f" [{block['module_name']}]" if block["module_name"] else ""
     class_part = f" {block['class_type']}" if block["class_type"] else ""
     location_part = f" at {block['location']}" if block["location"] else ""
+    week_part = (
+        f" (weeks: {block['week_pattern']})"
+        if block.get("week_pattern") and block["week_pattern"] != "every"
+        else ""
+    )
     return (
         f"Created schedule block #{block['id']}{module_part}{class_part}: {when} "
-        f"{block['start_time']}-{block['end_time']}{location_part}."
+        f"{block['start_time']}-{block['end_time']}{location_part}{week_part}."
     )
 
 
@@ -781,7 +870,10 @@ def _handle_query_schedule(tool_input: dict, chat_id: int, job_queue) -> str:
         blocks = database.list_schedule_blocks(
             chat_id=chat_id, date_from=date_from, date_to=date_to, module_name=module_name
         )
-        occurrences = _expand_occurrences(blocks, date_from, date_to)
+        try:
+            occurrences = _expand_occurrences(blocks, date_from, date_to, chat_id)
+        except AnchorNotSetError:
+            return ANCHOR_NOT_SET_MESSAGE
         if not occurrences:
             return "No schedule blocks in that range."
         lines = []
@@ -822,6 +914,14 @@ def _handle_delete_schedule_block(tool_input: dict, chat_id: int, job_queue) -> 
     return f"Deleted schedule block #{schedule_block_id} ({when} {block['start_time']}-{block['end_time']})."
 
 
+def _handle_set_semester_start(tool_input: dict, chat_id: int, job_queue) -> str:
+    start_date = database.set_semester_anchor(chat_id, tool_input["start_date"])
+    return (
+        f"Semester week 1 set to start on {start_date}. I'll use this to work "
+        "out which semester week any date falls in."
+    )
+
+
 TOOL_HANDLERS: dict[str, Callable[[dict, int, object], str]] = {
     "create_task": _handle_create_task,
     "query_tasks": _handle_query_tasks,
@@ -837,6 +937,7 @@ TOOL_HANDLERS: dict[str, Callable[[dict, int, object], str]] = {
     "create_schedule_block": _handle_create_schedule_block,
     "query_schedule": _handle_query_schedule,
     "delete_schedule_block": _handle_delete_schedule_block,
+    "set_semester_start": _handle_set_semester_start,
 }
 
 
