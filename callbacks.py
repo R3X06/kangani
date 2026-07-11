@@ -27,8 +27,23 @@ async def task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     try:
         parts = query.data.split(":")
+        # Strip a trailing ":evt:{id}" origin suffix unconditionally, BEFORE
+        # any action-specific parsing. A fixed-index check (e.g. parts[3] ==
+        # "evt") breaks for "status", whose own code already occupies index
+        # 3 (task:status:5:ns vs. task:status:5:ns:evt:12) -- stripping from
+        # the end works regardless of how many parts the action itself uses.
+        origin_event_id = None
+        if len(parts) >= 2 and parts[-2] == "evt":
+            origin_event_id = int(parts[-1])
+            parts = parts[:-2]
+
         action = parts[1]
         task_id = int(parts[2])
+
+        def _render_list():
+            if origin_event_id is not None:
+                return commands.build_events_detail_view(chat_id, origin_event_id)
+            return commands.build_tasks_view(chat_id)
 
         if action == "complete":
             task = database.update_task_status(
@@ -38,17 +53,20 @@ async def task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 _queue_nav_note(
                     context, f"User marked task #{task_id} ('{task['title']}') as done via a button tap."
                 )
-            text, kb = commands.build_tasks_view(chat_id)
+            text, kb = _render_list()
             await query.edit_message_text(text, reply_markup=kb)
 
         elif action == "menu":
             task = database.get_task(chat_id, task_id)
             if task is None:
                 await query.edit_message_text("That task no longer exists.")
+                await query.answer()
                 return
             await query.edit_message_text(
                 f"Editing task #{task_id}: {task['title']}\nCurrent status: {task['status']}",
-                reply_markup=keyboards.task_edit_menu_keyboard(task_id),
+                reply_markup=keyboards.task_edit_menu_keyboard(
+                    task_id, origin_event_id=origin_event_id
+                ),
             )
 
         elif action == "status":
@@ -64,11 +82,11 @@ async def task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                     f"User changed task #{task_id} ('{task['title']}') status to "
                     f"'{status}' via a button tap.",
                 )
-            text, kb = commands.build_tasks_view(chat_id)
+            text, kb = _render_list()
             await query.edit_message_text(text, reply_markup=kb)
 
         elif action == "back":
-            text, kb = commands.build_tasks_view(chat_id)
+            text, kb = _render_list()
             await query.edit_message_text(text, reply_markup=kb)
 
         await query.answer()
@@ -155,6 +173,28 @@ async def topic_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             text, kb = commands.build_topics_detail_view(chat_id, int(parts[2]))
         elif action == "notes":
             text, kb = commands.build_topics_notes_view(chat_id, int(parts[2]))
+        else:
+            await query.answer()
+            return
+
+        await query.edit_message_text(text, reply_markup=kb)
+        await query.answer()
+    except (IndexError, ValueError, KeyError):
+        await query.answer("Something went wrong with that button.", show_alert=True)
+
+
+async def event_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    chat_id = update.effective_chat.id
+
+    try:
+        parts = query.data.split(":")
+        action = parts[1]
+
+        if action == "root":
+            text, kb = commands.build_events_root_view(chat_id)
+        elif action == "open":
+            text, kb = commands.build_events_detail_view(chat_id, int(parts[2]))
         else:
             await query.answer()
             return

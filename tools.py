@@ -15,8 +15,11 @@ TOOL_SCHEMAS = [
     {
         "name": "create_task",
         "description": (
-            "Create a new task and tag it to a module. Creates the module if "
-            "it doesn't already exist for this chat."
+            "Create a new task and tag it to EITHER a module OR an event -- "
+            "exactly one of module_name/event_id must be given. Creates the "
+            "module if it doesn't already exist for this chat; an event must "
+            "already exist (look it up via query_events first, never guess "
+            "the id)."
         ),
         "input_schema": {
             "type": "object",
@@ -26,7 +29,16 @@ TOOL_SCHEMAS = [
                     "type": "string",
                     "description": (
                         "Module/category to tag this task to, e.g. Algorithms "
-                        "or General if uncategorized"
+                        "or General if uncategorized. Mutually exclusive with "
+                        "event_id -- give exactly one."
+                    ),
+                },
+                "event_id": {
+                    "type": "integer",
+                    "description": (
+                        "id of an existing event to tag this task to (e.g. a "
+                        "hackathon or talk), looked up via query_events. "
+                        "Mutually exclusive with module_name -- give exactly one."
                     ),
                 },
                 "deadline": {
@@ -46,7 +58,7 @@ TOOL_SCHEMAS = [
                     "description": "Defaults to not_started if omitted",
                 },
             },
-            "required": ["title", "module_name"],
+            "required": ["title"],
         },
     },
     {
@@ -63,6 +75,10 @@ TOOL_SCHEMAS = [
                     "enum": ["not_started", "in_progress", "blocked", "done"],
                 },
                 "module_name": {"type": "string"},
+                "event_id": {
+                    "type": "integer",
+                    "description": "Optional -- restrict to tasks under one event",
+                },
                 "deadline_from": {
                     "type": "string",
                     "description": "ISO-8601 UTC datetime, inclusive lower bound",
@@ -137,6 +153,59 @@ TOOL_SCHEMAS = [
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
+        "name": "create_event",
+        "description": (
+            "Create a new event -- a time-boxed activity like a hackathon or "
+            "talk that needs its own tasks/notes but isn't a recurring "
+            "academic module. Unlike modules, events are never auto-created "
+            "by name -- always create one explicitly via this tool."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Event title"},
+                "type": {
+                    "type": "string",
+                    "enum": ["talk", "hackathon", "other"],
+                },
+                "start_date": {
+                    "type": "string",
+                    "description": "ISO-8601 date YYYY-MM-DD. Optional.",
+                },
+                "end_date": {
+                    "type": "string",
+                    "description": "ISO-8601 date YYYY-MM-DD. Optional.",
+                },
+                "location": {"type": "string", "description": "Optional."},
+            },
+            "required": ["title", "type"],
+        },
+    },
+    {
+        "name": "query_events",
+        "description": (
+            "List events for this chat. Use this to find an event's id "
+            "before tagging a task or topic to it -- never guess an event_id."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": ["talk", "hackathon", "other"],
+                },
+                "upcoming_only": {
+                    "type": "boolean",
+                    "description": (
+                        "Default true -- excludes events that have already "
+                        "ended. Set false to include past events too."
+                    ),
+                },
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "create_topic",
         "description": (
             "Create a new topic under a module, or a subtopic under an "
@@ -157,10 +226,20 @@ TOOL_SCHEMAS = [
                     "type": "string",
                     "description": (
                         "Module/category this topic belongs to, e.g. Machine "
-                        "Learning. REQUIRED when creating a TOP-LEVEL topic "
+                        "Learning. Mutually exclusive with event_id -- give "
+                        "exactly one when creating a TOP-LEVEL topic "
                         "(parent_topic_id omitted). When creating a SUBTOPIC "
-                        "(parent_topic_id given), omit this -- it inherits "
-                        "its parent's module automatically."
+                        "(parent_topic_id given), omit both -- it inherits "
+                        "its parent's container (module or event) automatically."
+                    ),
+                },
+                "event_id": {
+                    "type": "integer",
+                    "description": (
+                        "id of an existing event this topic belongs to, "
+                        "looked up via query_events. Mutually exclusive with "
+                        "module_name -- give exactly one for a TOP-LEVEL "
+                        "topic; omit both for a subtopic."
                     ),
                 },
                 "parent_topic_id": {
@@ -313,6 +392,15 @@ TOOL_SCHEMAS = [
                     "type": "string",
                     "description": "Optional. Omit if this block has no study module.",
                 },
+                "class_type": {
+                    "type": "string",
+                    "description": (
+                        "Optional kind of class, e.g. Lecture, Tutorial, Lab, "
+                        "Seminar, Workshop. Set this for timetable classes so a "
+                        "module's lecture and tutorial stay distinguishable. "
+                        "Omit for non-class blocks (gym, errands)."
+                    ),
+                },
                 "location": {
                     "type": "string",
                     "description": "Optional room/location.",
@@ -370,6 +458,12 @@ TOOL_SCHEMAS = [
 ]
 
 
+def _container_label(row: dict) -> str:
+    """A task/topic/note's display label: whichever of module_name/event_title
+    is actually set (exactly one always is, per the schema's CHECK)."""
+    return row["module_name"] if row["module_name"] is not None else row["event_title"]
+
+
 def _handle_create_task(tool_input: dict, chat_id: int, job_queue) -> str:
     deadline_raw = tool_input.get("deadline")
     deadline_utc = (
@@ -381,14 +475,15 @@ def _handle_create_task(tool_input: dict, chat_id: int, job_queue) -> str:
     task = database.create_task(
         chat_id=chat_id,
         title=tool_input["title"],
-        module_name=tool_input["module_name"],
+        module_name=tool_input.get("module_name"),
+        event_id=tool_input.get("event_id"),
         deadline=deadline_utc,
         status=tool_input.get("status", "not_started"),
     )
     deadline_part = f", due {task['deadline']}" if task["deadline"] else ""
     return (
-        f"Created task #{task['id']} '{task['title']}' in module "
-        f"'{task['module_name']}'{deadline_part}. Status: {task['status']}."
+        f"Created task #{task['id']} '{task['title']}' under "
+        f"'{_container_label(task)}'{deadline_part}. Status: {task['status']}."
     )
 
 
@@ -400,6 +495,7 @@ def _handle_query_tasks(tool_input: dict, chat_id: int, job_queue) -> str:
         chat_id=chat_id,
         status=tool_input.get("status"),
         module_name=tool_input.get("module_name"),
+        event_id=tool_input.get("event_id"),
         deadline_from=(
             scheduler.format_utc_iso(scheduler.parse_iso_datetime(deadline_from_raw))
             if deadline_from_raw
@@ -418,7 +514,7 @@ def _handle_query_tasks(tool_input: dict, chat_id: int, job_queue) -> str:
     for t in tasks:
         deadline_part = f", deadline {t['deadline']}" if t["deadline"] else ""
         lines.append(
-            f"#{t['id']} [{t['module_name']}] {t['title']} — "
+            f"#{t['id']} [{_container_label(t)}] {t['title']} — "
             f"status: {t['status']}, progress: {t['progress_pct']}%{deadline_part}"
         )
     return "\n".join(lines)
@@ -486,11 +582,57 @@ def _handle_list_modules(tool_input: dict, chat_id: int, job_queue) -> str:
     return "\n".join(f"{m['name']} ({m['color']})" for m in modules)
 
 
+def _handle_create_event(tool_input: dict, chat_id: int, job_queue) -> str:
+    event = database.create_event(
+        chat_id=chat_id,
+        title=tool_input["title"],
+        type=tool_input["type"],
+        start_date=tool_input.get("start_date"),
+        end_date=tool_input.get("end_date"),
+        location=tool_input.get("location"),
+    )
+    date_part = (
+        f", {event['start_date']} to {event['end_date']}"
+        if event["start_date"] and event["end_date"]
+        else f", {event['start_date']}"
+        if event["start_date"]
+        else ""
+    )
+    location_part = f" at {event['location']}" if event["location"] else ""
+    return (
+        f"Created event #{event['id']} '{event['title']}' "
+        f"({event['type']}){date_part}{location_part}."
+    )
+
+
+def _handle_query_events(tool_input: dict, chat_id: int, job_queue) -> str:
+    events = database.query_events(
+        chat_id=chat_id,
+        type=tool_input.get("type"),
+        upcoming_only=tool_input.get("upcoming_only", True),
+    )
+    if not events:
+        return "No events match those filters."
+    lines = []
+    for e in events:
+        date_part = (
+            f", {e['start_date']} to {e['end_date']}"
+            if e["start_date"] and e["end_date"]
+            else f", {e['start_date']}"
+            if e["start_date"]
+            else ""
+        )
+        location_part = f" at {e['location']}" if e["location"] else ""
+        lines.append(f"#{e['id']} {e['title']} ({e['type']}){date_part}{location_part}")
+    return "\n".join(lines)
+
+
 def _handle_create_topic(tool_input: dict, chat_id: int, job_queue) -> str:
     topic = database.get_or_create_topic(
         chat_id=chat_id,
         name=tool_input["name"],
         module_name=tool_input.get("module_name"),
+        event_id=tool_input.get("event_id"),
         parent_topic_id=tool_input.get("parent_topic_id"),
     )
     topics = database.list_topics(chat_id)
@@ -517,7 +659,7 @@ def _handle_add_note(tool_input: dict, chat_id: int, job_queue) -> str:
     source_part = f", source: {note['source']}" if note["source"] else ""
     return (
         f"Saved note #{note['id']} under "
-        f"'{note['module_name']} > {note['topic_name']}'{tag}{source_part}."
+        f"'{_container_label(note)} > {note['topic_name']}'{tag}{source_part}."
     )
 
 
@@ -576,7 +718,7 @@ def _handle_query_notes(tool_input: dict, chat_id: int, job_queue) -> str:
         tag = "[reference] " if n["is_reference"] else ""
         source_part = f" (source: {n['source']})" if n["source"] else ""
         lines.append(
-            f"#{n['id']} [{n['module_name']} > {n['topic_name']}] "
+            f"#{n['id']} [{_container_label(n)} > {n['topic_name']}] "
             f"{tag}{n['content']}{source_part}"
         )
     return "\n".join(lines)
@@ -613,13 +755,15 @@ def _handle_create_schedule_block(tool_input: dict, chat_id: int, job_queue) -> 
         day_of_week=tool_input.get("day_of_week"),
         specific_date=tool_input.get("specific_date"),
         module_name=tool_input.get("module_name"),
+        class_type=tool_input.get("class_type"),
         location=tool_input.get("location"),
     )
     when = block["day_of_week"] if block["day_of_week"] else block["specific_date"]
     module_part = f" [{block['module_name']}]" if block["module_name"] else ""
+    class_part = f" {block['class_type']}" if block["class_type"] else ""
     location_part = f" at {block['location']}" if block["location"] else ""
     return (
-        f"Created schedule block #{block['id']}{module_part}: {when} "
+        f"Created schedule block #{block['id']}{module_part}{class_part}: {when} "
         f"{block['start_time']}-{block['end_time']}{location_part}."
     )
 
@@ -643,9 +787,10 @@ def _handle_query_schedule(tool_input: dict, chat_id: int, job_queue) -> str:
         lines = []
         for o in occurrences:
             module_part = f" [{o['module_name']}]" if o["module_name"] else ""
+            class_part = f" {o['class_type']}" if o["class_type"] else ""
             location_part = f" at {o['location']}" if o["location"] else ""
             lines.append(
-                f"#{o['id']}{module_part} {o['occurrence_date']} "
+                f"#{o['id']}{module_part}{class_part} {o['occurrence_date']} "
                 f"{o['start_time']}-{o['end_time']}{location_part}"
             )
         return "\n".join(lines)
@@ -657,9 +802,11 @@ def _handle_query_schedule(tool_input: dict, chat_id: int, job_queue) -> str:
     for b in blocks:
         when = b["day_of_week"] if b["day_of_week"] else b["specific_date"]
         module_part = f" [{b['module_name']}]" if b["module_name"] else ""
+        class_part = f" {b['class_type']}" if b["class_type"] else ""
         location_part = f" at {b['location']}" if b["location"] else ""
         lines.append(
-            f"#{b['id']}{module_part} {when} {b['start_time']}-{b['end_time']}{location_part}"
+            f"#{b['id']}{module_part}{class_part} {when} "
+            f"{b['start_time']}-{b['end_time']}{location_part}"
         )
     return "\n".join(lines)
 
@@ -681,6 +828,8 @@ TOOL_HANDLERS: dict[str, Callable[[dict, int, object], str]] = {
     "update_task_status": _handle_update_task_status,
     "create_reminder": _handle_create_reminder,
     "list_modules": _handle_list_modules,
+    "create_event": _handle_create_event,
+    "query_events": _handle_query_events,
     "create_topic": _handle_create_topic,
     "list_topics": _handle_list_topics,
     "add_note": _handle_add_note,

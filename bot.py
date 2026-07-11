@@ -34,6 +34,7 @@ BOT_COMMANDS = [
     BotCommand("reminders", "View and cancel upcoming reminders"),
     BotCommand("topics", "Browse your topics and notes"),
     BotCommand("notes", "View your recent notes"),
+    BotCommand("events", "Browse your events"),
     BotCommand("help", "What Kangani can do"),
     BotCommand("settings", "View your current settings"),
 ]
@@ -99,6 +100,7 @@ def main() -> None:
     application.add_handler(CommandHandler("reminders", commands.reminders_command))
     application.add_handler(CommandHandler("topics", commands.topics_command))
     application.add_handler(CommandHandler("notes", commands.notes_command))
+    application.add_handler(CommandHandler("events", commands.events_command))
     application.add_handler(CommandHandler("menu", commands.menu_command))
     application.add_handler(CommandHandler("help", commands.help_command))
     application.add_handler(CommandHandler("settings", commands.settings_command))
@@ -112,6 +114,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(callbacks.task_callback, pattern=r"^task:"))
     application.add_handler(CallbackQueryHandler(callbacks.reminder_callback, pattern=r"^rem:"))
     application.add_handler(CallbackQueryHandler(callbacks.topic_callback, pattern=r"^topic:"))
+    application.add_handler(CallbackQueryHandler(callbacks.event_callback, pattern=r"^event:"))
 
     application.add_error_handler(error_handler)
 

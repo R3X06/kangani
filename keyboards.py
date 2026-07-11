@@ -8,12 +8,15 @@ TASKS_LABEL = "\U0001F4CB Tasks"
 REMINDERS_LABEL = "⏰ Reminders"
 TOPICS_LABEL = "\U0001F4DA Topics"
 NOTES_LABEL = "\U0001F4DD Notes"
+EVENTS_LABEL = "\U0001F5D3️ Events"
 
 # Single source of truth for the reply-keyboard button labels, so the labels
 # used to BUILD the keyboard and the labels used to MATCH incoming
 # button-press text (an ordinary text message, as far as Telegram/PTB is
 # concerned) can never drift apart.
-NAV_LABELS = frozenset({TASKS_LABEL, REMINDERS_LABEL, TOPICS_LABEL, NOTES_LABEL})
+NAV_LABELS = frozenset(
+    {TASKS_LABEL, REMINDERS_LABEL, TOPICS_LABEL, NOTES_LABEL, EVENTS_LABEL}
+)
 
 # 2-letter codes used in callback_data (e.g. "task:status:42:ip") instead of
 # the full enum string, keeping payloads compact and decoding centralized.
@@ -41,39 +44,52 @@ def persistent_reply_keyboard() -> ReplyKeyboardMarkup:
         [
             [TASKS_LABEL, REMINDERS_LABEL],
             [TOPICS_LABEL, NOTES_LABEL],
+            [EVENTS_LABEL],
         ],
         resize_keyboard=True,
         is_persistent=True,
     )
 
 
-def task_list_keyboard(tasks: list[dict]) -> InlineKeyboardMarkup:
+def _origin_suffix(origin_event_id: int | None) -> str:
+    return f":evt:{origin_event_id}" if origin_event_id is not None else ""
+
+
+def task_list_keyboard(
+    tasks: list[dict], origin_event_id: int | None = None
+) -> InlineKeyboardMarkup:
+    suffix = _origin_suffix(origin_event_id)
     rows = []
     for t in tasks:
         rows.append(
             [
                 InlineKeyboardButton(
-                    f"✅ Complete #{t['id']}", callback_data=f"task:complete:{t['id']}"
+                    f"✅ Complete #{t['id']}",
+                    callback_data=f"task:complete:{t['id']}{suffix}",
                 ),
                 InlineKeyboardButton(
-                    f"✏️ Edit #{t['id']}", callback_data=f"task:menu:{t['id']}"
+                    f"✏️ Edit #{t['id']}", callback_data=f"task:menu:{t['id']}{suffix}"
                 ),
             ]
         )
     return InlineKeyboardMarkup(rows)
 
 
-def task_edit_menu_keyboard(task_id: int) -> InlineKeyboardMarkup:
+def task_edit_menu_keyboard(
+    task_id: int, origin_event_id: int | None = None
+) -> InlineKeyboardMarkup:
+    suffix = _origin_suffix(origin_event_id)
     rows = [
         [
             InlineKeyboardButton(
-                STATUS_LABELS[code], callback_data=f"task:status:{task_id}:{code}"
+                STATUS_LABELS[code],
+                callback_data=f"task:status:{task_id}:{code}{suffix}",
             )
         ]
         for code in ("ns", "ip", "bl", "dn")
     ]
     rows.append(
-        [InlineKeyboardButton("⬅️ Back", callback_data=f"task:back:{task_id}")]
+        [InlineKeyboardButton("⬅️ Back", callback_data=f"task:back:{task_id}{suffix}")]
     )
     return InlineKeyboardMarkup(rows)
 
@@ -141,3 +157,23 @@ def topic_notes_keyboard(topic_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("⬅️ Back", callback_data=f"topic:open:{topic_id}")]]
     )
+
+
+def event_list_keyboard(events: list[dict]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(e["title"], callback_data=f"event:open:{e['id']}")]
+        for e in events
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def event_detail_keyboard(
+    event_id: int, tasks: list[dict], topics: list[dict]
+) -> InlineKeyboardMarkup:
+    rows = list(task_list_keyboard(tasks, origin_event_id=event_id).inline_keyboard)
+    for t in topics:
+        rows.append(
+            [InlineKeyboardButton(t["name"], callback_data=f"topic:open:{t['id']}")]
+        )
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="event:root")])
+    return InlineKeyboardMarkup(rows)

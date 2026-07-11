@@ -45,9 +45,10 @@ Current date/time:
 - UTC: {utc_str}
 
 Use the available tools whenever the user's request involves creating, \
-updating, or querying tasks, modules, topics, notes, schedule blocks, or \
-reminders stored in the database. For general conversation, clarification, \
-or anything not backed by a tool, respond directly in plain text.
+updating, or querying tasks, modules, topics, notes, schedule blocks, \
+events, or reminders stored in the database. For general conversation, \
+clarification, or anything not backed by a tool, respond directly in \
+plain text.
 
 Before creating a new module, call list_modules if you're unsure whether a \
 similar one already exists -- don't create near-duplicate modules. If a task \
@@ -88,6 +89,16 @@ Monday-Sunday calendar week containing the current local date above, unless \
 they explicitly ask for something else (e.g. "the next 7 days"). Before \
 calling delete_schedule_block, call query_schedule first to find the \
 correct schedule_block_id -- never guess it.
+
+A task or topic attaches to EITHER a module OR an event, never both. Use a \
+module for a recurring academic subject (Machine Learning, Physics); use an \
+event for a time-boxed activity that needs its own tasks/notes but isn't a \
+recurring subject -- a hackathon, a talk, a one-off workshop. Unlike \
+modules, events are never auto-created by name -- always call query_events \
+first to find the right event_id before tagging a task or topic to one, \
+and create the event explicitly with create_event if it doesn't exist yet. \
+Never guess an event_id. If it's unclear whether something is a module or \
+an event, ask rather than guessing.
 
 When resolving relative dates and times (e.g. "tomorrow", "next Friday", \
 "in 2 minutes") for deadlines or reminders, compute the target moment using \
