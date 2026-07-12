@@ -215,7 +215,12 @@ def build_today_view(chat_id: int) -> str:
 
     anchor = database.get_semester_anchor(chat_id)
     anchor_date = date.fromisoformat(anchor) if anchor else None
-    wk = scheduler.compute_week_number(anchor_date, today) if anchor_date else None
+    recess = frozenset(database.get_recess_weeks(chat_id))
+    wk = (
+        scheduler.compute_week_number(anchor_date, today, recess)
+        if anchor_date
+        else None
+    )
     header = f"Today — {today.strftime('%A %d %b')}"
     if wk is not None:
         header += f"  ·  Week {wk}"
@@ -227,7 +232,9 @@ def build_today_view(chat_id: int) -> str:
     )
     lines.append("Classes")
     try:
-        occ = scheduler.expand_occurrences(blocks, today_iso, today_iso, anchor_date)
+        occ = scheduler.expand_occurrences(
+            blocks, today_iso, today_iso, anchor_date, recess
+        )
         if occ:
             lines.extend(f"  {_class_row(o)}" for o in occ)
         else:
@@ -265,10 +272,11 @@ def build_week_view(chat_id: int, week_number: int | None = None) -> str:
     today = datetime.now(tz).date()
     anchor = database.get_semester_anchor(chat_id)
     anchor_date = date.fromisoformat(anchor) if anchor else None
+    recess = frozenset(database.get_recess_weeks(chat_id))
 
     try:
         monday, sunday, wk_label = scheduler.resolve_week_range(
-            anchor_date, today, week_number
+            anchor_date, today, week_number, recess
         )
     except scheduler.AnchorNotSetError:
         # An explicit week only makes sense relative to the anchor.
@@ -285,6 +293,7 @@ def build_week_view(chat_id: int, week_number: int | None = None) -> str:
             monday.isoformat(),
             sunday.isoformat(),
             anchor_date,
+            recess,
         )
     except scheduler.AnchorNotSetError:
         return _wrap_pre(html.escape(scheduler.ANCHOR_NOT_SET_MESSAGE))

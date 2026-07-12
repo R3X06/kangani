@@ -38,6 +38,10 @@ def _anchor_date(chat_id: int) -> date | None:
     return date.fromisoformat(anchor) if anchor else None
 
 
+def _recess_weeks(chat_id: int) -> frozenset[int]:
+    return frozenset(database.get_recess_weeks(chat_id))
+
+
 def _color_map(chat_id: int) -> dict[str, str]:
     return {m["name"]: m["color"] for m in database.list_modules(chat_id)}
 
@@ -80,10 +84,11 @@ def build_daily_context(chat_id: int, target_date: date) -> dict:
     tz = _tz()
     iso = target_date.isoformat()
     anchor_date = _anchor_date(chat_id)
+    recess = _recess_weeks(chat_id)
     color_map = _color_map(chat_id)
 
     blocks = database.list_schedule_blocks(chat_id=chat_id, date_from=iso, date_to=iso)
-    occ = scheduler.expand_occurrences(blocks, iso, iso, anchor_date)
+    occ = scheduler.expand_occurrences(blocks, iso, iso, anchor_date, recess)
     slots = [
         {
             "start_time": o["start_time"],
@@ -96,7 +101,7 @@ def build_daily_context(chat_id: int, target_date: date) -> dict:
     ]
 
     wk = (
-        scheduler.compute_week_number(anchor_date, target_date)
+        scheduler.compute_week_number(anchor_date, target_date, recess)
         if anchor_date
         else None
     )
@@ -132,10 +137,11 @@ def build_weekly_context(chat_id: int, week_number: int | None = None) -> dict:
     tz = _tz()
     today = datetime.now(tz).date()
     anchor_date = _anchor_date(chat_id)
+    recess = _recess_weeks(chat_id)
     color_map = _color_map(chat_id)
 
     monday, sunday, wk_label = scheduler.resolve_week_range(
-        anchor_date, today, week_number
+        anchor_date, today, week_number, recess
     )
 
     occ = scheduler.expand_occurrences(
@@ -147,6 +153,7 @@ def build_weekly_context(chat_id: int, week_number: int | None = None) -> dict:
         monday.isoformat(),
         sunday.isoformat(),
         anchor_date,
+        recess,
     )
     by_day: dict[str, list[dict]] = {}
     for o in occ:  # already sorted by (occurrence_date, start_time)
@@ -181,6 +188,7 @@ def build_monthly_context(chat_id: int, year: int, month: int) -> dict:
     tz = _tz()
     today = datetime.now(tz).date()
     anchor_date = _anchor_date(chat_id)
+    recess = _recess_weeks(chat_id)
     color_map = _color_map(chat_id)
 
     first = date(year, month, 1)
@@ -194,6 +202,7 @@ def build_monthly_context(chat_id: int, year: int, month: int) -> dict:
         first.isoformat(),
         last.isoformat(),
         anchor_date,
+        recess,
     )
     marks_by_day: dict[str, list[dict]] = {}
     modules_seen: dict[str, str] = {}  # only modules that appear this month

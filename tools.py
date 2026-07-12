@@ -495,6 +495,36 @@ TOOL_SCHEMAS = [
             "required": ["start_date"],
         },
     },
+    {
+        "name": "set_recess_weeks",
+        "description": (
+            "Mark one or more recess / reading / break weeks (weeks with no "
+            "teaching) so Kangani's week numbers stay aligned with the school's "
+            "OFFICIAL numbering -- recess weeks are then skipped automatically "
+            "when counting weeks, and classes are hidden during them. Identify "
+            "each recess week by ANY single calendar date that falls within it "
+            "(e.g. its Monday) -- you do NOT need to work out its week number. "
+            "This marks a WHOLE week as recess; it is not for skipping an "
+            "individual class (use a week_pattern for that). For a multi-week "
+            "break, pass one date from each week. Requires the semester start "
+            "date to be set first. Idempotent -- calling again replaces the "
+            "recess set entirely."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "recess_dates": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "ISO-8601 dates YYYY-MM-DD, one per recess week (any "
+                        "date within the week)."
+                    ),
+                },
+            },
+            "required": ["recess_dates"],
+        },
+    },
 ]
 
 
@@ -809,9 +839,10 @@ def _handle_query_schedule(tool_input: dict, chat_id: int, job_queue) -> str:
         )
         anchor = database.get_semester_anchor(chat_id)
         anchor_date = date.fromisoformat(anchor) if anchor else None
+        recess = frozenset(database.get_recess_weeks(chat_id))
         try:
             occurrences = scheduler.expand_occurrences(
-                blocks, date_from, date_to, anchor_date
+                blocks, date_from, date_to, anchor_date, recess
             )
         except scheduler.AnchorNotSetError:
             return scheduler.ANCHOR_NOT_SET_MESSAGE
@@ -863,6 +894,18 @@ def _handle_set_semester_start(tool_input: dict, chat_id: int, job_queue) -> str
     )
 
 
+def _handle_set_recess_weeks(tool_input: dict, chat_id: int, job_queue) -> str:
+    weeks = database.set_recess_weeks(chat_id, tool_input["recess_dates"])
+    if not weeks:
+        return "No recess weeks recorded."
+    week_list = ", ".join(str(w) for w in weeks)
+    return (
+        f"Recorded {len(weeks)} recess week(s) (continuous week {week_list}). "
+        "I'll skip them in the official week numbering and hide classes during "
+        "them from now on."
+    )
+
+
 TOOL_HANDLERS: dict[str, Callable[[dict, int, object], str]] = {
     "create_task": _handle_create_task,
     "query_tasks": _handle_query_tasks,
@@ -879,6 +922,7 @@ TOOL_HANDLERS: dict[str, Callable[[dict, int, object], str]] = {
     "query_schedule": _handle_query_schedule,
     "delete_schedule_block": _handle_delete_schedule_block,
     "set_semester_start": _handle_set_semester_start,
+    "set_recess_weeks": _handle_set_recess_weeks,
 }
 
 

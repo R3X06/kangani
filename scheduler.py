@@ -46,33 +46,85 @@ def format_utc_iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
-def compute_week_number(anchor_date: date, target_date: date) -> int | None:
-    """Semester week number of target_date given week 1 starts on anchor_date.
+# Number of official teaching weeks in a semester -- the span a real,
+# recess-adjusted week number must land in to be meaningful.
+_MAX_SEMESTER_WEEK = 13
 
-    Weeks are 7-day blocks counted from the anchor (day 0 -> week 1). Returns
-    None if target_date is before the anchor or past week 13 (outside the
-    13-week semester), so callers can distinguish "no such week" from a real
-    week number rather than clamping silently.
+
+def _raw_week_number(anchor_date: date, target_date: date) -> int | None:
+    """Continuous week count since the anchor: 7-day blocks from the anchor
+    (day 0 -> week 1), uncapped and with NO recess adjustment. None if
+    target_date is before the anchor.
+
+    This is the raw calendar count recess weeks are themselves stored in terms
+    of, so it must never subtract them -- otherwise the stored recess numbers
+    and the counting they're compared against would drift apart.
     """
     if target_date < anchor_date:
         return None
-    wk = ((target_date - anchor_date).days // 7) + 1
-    return wk if wk <= 13 else None
+    return ((target_date - anchor_date).days // 7) + 1
+
+
+def compute_week_number(
+    anchor_date: date, target_date: date, recess_weeks: frozenset[int] = frozenset()
+) -> int | None:
+    """Official (recess-adjusted) semester week number of target_date.
+
+    Starts from the raw continuous count, then:
+    - returns None if target_date is before the anchor, or its raw week IS a
+      recess week (a recess week has no official teaching-week number);
+    - otherwise subtracts however many recess weeks fall strictly before it
+      (each one shifts the official numbering down by one from there on);
+    - returns that only if it lands in 1..13, else None (pre-/post-semester).
+
+    This is what /week N, week_pattern, and everything user-facing means by
+    "week N": the school's official numbering with recess weeks skipped.
+    """
+    raw = _raw_week_number(anchor_date, target_date)
+    if raw is None or raw in recess_weeks:
+        return None
+    official = raw - sum(1 for r in recess_weeks if r < raw)
+    return official if 1 <= official <= _MAX_SEMESTER_WEEK else None
+
+
+def official_to_continuous(
+    official_week: int, recess_weeks: frozenset[int] = frozenset()
+) -> int:
+    """Inverse of compute_week_number: the continuous week that carries a given
+    official week number.
+
+    Recess weeks push everything after them one slot later, so the continuous
+    week is the official number plus however many recess weeks fall at or
+    before it. That's self-referential (adding a recess week can pull another
+    recess week into range), so iterate to a fixed point -- recess sets are
+    tiny, so this settles in a couple of passes.
+    """
+    continuous = official_week
+    while True:
+        shifted = official_week + sum(1 for r in recess_weeks if r <= continuous)
+        if shifted == continuous:
+            return continuous
+        continuous = shifted
 
 
 WEEKDAY_CODES = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
 
 
 def resolve_week_range(
-    anchor_date: date | None, today: date, week_number: int | None
+    anchor_date: date | None,
+    today: date,
+    week_number: int | None,
+    recess_weeks: frozenset[int] = frozenset(),
 ) -> tuple[date, date, int | None]:
     """Resolve a (monday, sunday, week_label) triple for a week view.
 
-    With an explicit week_number, the Monday is derived from the anchor
-    (week 1 starts on the anchor); this only makes sense with an anchor set,
-    so anchor_date=None raises AnchorNotSetError. With week_number=None it's
-    the Monday..Sunday containing `today`, and the label is that week's
-    semester number if an anchor exists (else None).
+    week_number here is an OFFICIAL week number, so it's converted to its
+    continuous count via official_to_continuous before deriving the Monday --
+    that's what makes /week N land on the right calendar week once recess weeks
+    have shifted the numbering. An explicit week only makes sense with an
+    anchor set, so anchor_date=None raises AnchorNotSetError. With
+    week_number=None it's the Monday..Sunday containing `today`, labelled with
+    that week's official (recess-aware) number if an anchor exists (else None).
 
     Shared by commands.build_week_view and timetable_data.build_weekly_context
     so a /week text view and its rendered image always cover the same range.
@@ -80,11 +132,16 @@ def resolve_week_range(
     if week_number is not None:
         if anchor_date is None:
             raise AnchorNotSetError(ANCHOR_NOT_SET_MESSAGE)
-        monday = anchor_date + timedelta(days=7 * (week_number - 1))
+        continuous = official_to_continuous(week_number, recess_weeks)
+        monday = anchor_date + timedelta(days=7 * (continuous - 1))
         wk_label: int | None = week_number
     else:
         monday = today - timedelta(days=today.weekday())  # Monday of this week
-        wk_label = compute_week_number(anchor_date, monday) if anchor_date else None
+        wk_label = (
+            compute_week_number(anchor_date, monday, recess_weeks)
+            if anchor_date
+            else None
+        )
     return monday, monday + timedelta(days=6), wk_label
 
 ANCHOR_NOT_SET_MESSAGE = (
@@ -111,28 +168,40 @@ def week_matches(week_pattern: str, week_number: int) -> bool:
 
 
 def expand_occurrences(
-    blocks: list[dict], date_from: str, date_to: str, anchor_date: date | None
+    blocks: list[dict],
+    date_from: str,
+    date_to: str,
+    anchor_date: date | None,
+    recess_weeks: frozenset[int] = frozenset(),
 ) -> list[dict]:
     """Expand recurring/one-off schedule blocks into concrete dated occurrences
     within [date_from, date_to], applying each block's week_pattern.
 
-    The semester anchor is passed in (resolved once by the caller) rather than
-    re-queried here. Blocks with the default 'every' pattern never need it; a
-    non-'every' block with anchor_date=None is unresolvable, so we raise
-    AnchorNotSetError rather than guess whether it runs this week.
+    The semester anchor and recess-week set are passed in (resolved once by the
+    caller) rather than re-queried here. 'every' means "every official teaching
+    week", so once an anchor is set, any date whose official week is None --
+    pre-semester, post-semester, OR a recess week -- shows nothing regardless of
+    pattern. Only when no anchor is set at all do we skip the bounds check (an
+    'every' block still shows; an odd/even/explicit-list block is genuinely
+    unresolvable, so it raises AnchorNotSetError).
     """
     d_from = date.fromisoformat(date_from)
     d_to = date.fromisoformat(date_to)
 
     def _keep(candidate_date: date, block: dict) -> bool:
         pattern = block.get("week_pattern") or "every"
+        if anchor_date is None:
+            # No anchor yet -- nothing to bound 'every' against, so it shows
+            # unconditionally; but odd/even/explicit-list patterns are genuinely
+            # unresolvable without an anchor, so those still raise.
+            if pattern == "every":
+                return True
+            raise AnchorNotSetError(ANCHOR_NOT_SET_MESSAGE)
+        wk = compute_week_number(anchor_date, candidate_date, recess_weeks)
+        if wk is None:  # pre-/post-semester or a recess week -> doesn't run
+            return False
         if pattern == "every":
             return True
-        if anchor_date is None:
-            raise AnchorNotSetError(ANCHOR_NOT_SET_MESSAGE)
-        wk = compute_week_number(anchor_date, candidate_date)
-        if wk is None:  # outside the semester -> the class doesn't run
-            return False
         return week_matches(pattern, wk)
 
     occurrences = []

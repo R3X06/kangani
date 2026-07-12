@@ -10,6 +10,7 @@ import re
 import sqlite3
 from datetime import date
 from pathlib import Path
+from datetime import date, timedelta
 
 DB_PATH = Path(__file__).parent / "kangani.db"
 
@@ -215,6 +216,10 @@ def init_db() -> None:
         _ensure_column(
             conn, "schedule_blocks", "week_pattern", "TEXT NOT NULL DEFAULT 'every'"
         )
+        # Comma-separated CONTINUOUS week numbers marked as recess (no teaching),
+        # e.g. "7" or "7,14"; NULL/empty means none. Nullable, added additively
+        # so it never disturbs an existing (possibly live) chat_settings row.
+        _ensure_column(conn, "chat_settings", "recess_weeks", "TEXT")
         conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
         conn.commit()
     finally:
@@ -949,28 +954,34 @@ def find_matching_schedule_block(
 def set_semester_anchor(chat_id: int, start_date: str) -> str:
     """Upsert the single chat_settings row holding the semester week-1 anchor.
 
-    start_date is a plain YYYY-MM-DD calendar date (the first day / Monday of
-    week 1), validated here. Idempotent -- calling again just overwrites it.
+    start_date is a plain YYYY-MM-DD calendar date. Weeks are always
+    Monday-Sunday elsewhere in this schema (query_schedule's "this week"
+    range, resolve_week_range, etc.), so whatever date is given here is
+    snapped to the Monday of its calendar week before storing -- this way
+    "week 1 starts August 13th" (a Thursday) still anchors correctly to the
+    Monday (Aug 10) that actually begins that week, regardless of which day
+    of the week happened to get mentioned in conversation. Idempotent --
+    calling again just overwrites it.
     """
     try:
-        date.fromisoformat(start_date)
+        parsed = date.fromisoformat(start_date)
     except ValueError:
         raise ValueError(
             f"start_date must be an ISO-8601 date YYYY-MM-DD, got {start_date!r}"
         ) from None
+    monday = (parsed - timedelta(days=parsed.weekday())).isoformat()
     conn = get_connection()
     try:
         conn.execute(
             "INSERT INTO chat_settings (chat_id, semester_week1_start_date) "
             "VALUES (?, ?) ON CONFLICT(chat_id) DO UPDATE SET "
             "semester_week1_start_date = excluded.semester_week1_start_date",
-            (chat_id, start_date),
+            (chat_id, monday),
         )
         conn.commit()
-        return start_date
+        return monday
     finally:
         conn.close()
-
 
 def get_semester_anchor(chat_id: int) -> str | None:
     conn = get_connection()
@@ -982,3 +993,67 @@ def get_semester_anchor(chat_id: int) -> str | None:
         return row["semester_week1_start_date"] if row else None
     finally:
         conn.close()
+
+
+def set_recess_weeks(chat_id: int, recess_dates: list[str]) -> list[int]:
+    """Mark recess weeks by DATE and store them as CONTINUOUS week numbers.
+
+    Each given ISO date is resolved to its continuous week relative to the
+    stored anchor (raw count from the anchor's Monday, no recess adjustment --
+    recess weeks are numbered independently of one another). Requires an anchor
+    to already be set, since a week number is meaningless without one. A date
+    before the anchor has no week and is rejected. Idempotent: the stored set
+    is replaced wholesale, not accumulated.
+    """
+    anchor = get_semester_anchor(chat_id)
+    if anchor is None:
+        raise ValueError(
+            "Set the semester start date before marking recess weeks -- a recess "
+            "week has no number without an anchor to count from."
+        )
+    anchor_date = date.fromisoformat(anchor)
+
+    weeks: set[int] = set()
+    for d in recess_dates:
+        try:
+            rd = date.fromisoformat(d)
+        except (ValueError, TypeError):
+            raise ValueError(
+                f"recess date must be an ISO-8601 date YYYY-MM-DD, got {d!r}"
+            ) from None
+        if rd < anchor_date:
+            raise ValueError(
+                f"recess date {d} is before semester week 1 ({anchor}), so it "
+                "has no week number."
+            )
+        weeks.add(((rd - anchor_date).days // 7) + 1)
+
+    stored = ",".join(str(w) for w in sorted(weeks))
+    conn = get_connection()
+    try:
+        # The chat_settings row already exists (anchor is set), so this always
+        # takes the ON CONFLICT branch and leaves semester_week1_start_date be.
+        conn.execute(
+            "INSERT INTO chat_settings (chat_id, recess_weeks) VALUES (?, ?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET recess_weeks = excluded.recess_weeks",
+            (chat_id, stored),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return sorted(weeks)
+
+
+def get_recess_weeks(chat_id: int) -> set[int]:
+    """The stored continuous recess-week numbers for a chat; empty set if none."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT recess_weeks FROM chat_settings WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row or not row["recess_weeks"]:
+        return set()
+    return {int(p) for p in row["recess_weeks"].split(",")}
