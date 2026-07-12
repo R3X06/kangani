@@ -9,6 +9,7 @@ slash-command equivalent always render identically -- one query, one
 keyboard build, multiple thin entry points.
 """
 
+import calendar
 import html
 import os
 from datetime import date, datetime, time, timedelta
@@ -20,7 +21,7 @@ from telegram.ext import ContextTypes
 import database
 import keyboards
 import scheduler
-import tools
+import timetable_image
 
 
 def _container_label(row: dict) -> str:
@@ -213,11 +214,8 @@ def build_today_view(chat_id: int) -> str:
     today_iso = today.isoformat()
 
     anchor = database.get_semester_anchor(chat_id)
-    wk = (
-        scheduler.compute_week_number(date.fromisoformat(anchor), today)
-        if anchor
-        else None
-    )
+    anchor_date = date.fromisoformat(anchor) if anchor else None
+    wk = scheduler.compute_week_number(anchor_date, today) if anchor_date else None
     header = f"Today — {today.strftime('%A %d %b')}"
     if wk is not None:
         header += f"  ·  Week {wk}"
@@ -229,13 +227,13 @@ def build_today_view(chat_id: int) -> str:
     )
     lines.append("Classes")
     try:
-        occ = tools._expand_occurrences(blocks, today_iso, today_iso, chat_id)
+        occ = scheduler.expand_occurrences(blocks, today_iso, today_iso, anchor_date)
         if occ:
             lines.extend(f"  {_class_row(o)}" for o in occ)
         else:
             lines.append("  No classes today")
-    except tools.AnchorNotSetError:
-        lines.append(f"  {html.escape(tools.ANCHOR_NOT_SET_MESSAGE)}")
+    except scheduler.AnchorNotSetError:
+        lines.append(f"  {html.escape(scheduler.ANCHOR_NOT_SET_MESSAGE)}")
 
     # Section 2: tasks due today (omitted entirely when empty).
     start_utc = scheduler.format_utc_iso(datetime.combine(today, time.min, tzinfo=tz))
@@ -268,33 +266,28 @@ def build_week_view(chat_id: int, week_number: int | None = None) -> str:
     anchor = database.get_semester_anchor(chat_id)
     anchor_date = date.fromisoformat(anchor) if anchor else None
 
-    if week_number is not None:
-        # An explicit week only makes sense relative to the anchor.
-        if anchor_date is None:
-            return _wrap_pre(html.escape(tools.ANCHOR_NOT_SET_MESSAGE))
-        monday = anchor_date + timedelta(days=7 * (week_number - 1))
-        wk_label = week_number
-    else:
-        monday = today - timedelta(days=today.weekday())  # Monday of this week
-        wk_label = (
-            scheduler.compute_week_number(anchor_date, monday) if anchor_date else None
+    try:
+        monday, sunday, wk_label = scheduler.resolve_week_range(
+            anchor_date, today, week_number
         )
-    sunday = monday + timedelta(days=6)
+    except scheduler.AnchorNotSetError:
+        # An explicit week only makes sense relative to the anchor.
+        return _wrap_pre(html.escape(scheduler.ANCHOR_NOT_SET_MESSAGE))
 
     range_str = f"{monday.strftime('%d %b')} – {sunday.strftime('%d %b')}"
     header = f"Week {wk_label}  ({range_str})" if wk_label is not None else range_str
 
     try:
-        occ = tools._expand_occurrences(
+        occ = scheduler.expand_occurrences(
             database.list_schedule_blocks(
                 chat_id=chat_id, date_from=monday.isoformat(), date_to=sunday.isoformat()
             ),
             monday.isoformat(),
             sunday.isoformat(),
-            chat_id,
+            anchor_date,
         )
-    except tools.AnchorNotSetError:
-        return _wrap_pre(html.escape(tools.ANCHOR_NOT_SET_MESSAGE))
+    except scheduler.AnchorNotSetError:
+        return _wrap_pre(html.escape(scheduler.ANCHOR_NOT_SET_MESSAGE))
 
     by_day: dict[str, list[dict]] = {}
     for o in occ:  # already sorted by (occurrence_date, start_time)
@@ -333,6 +326,103 @@ async def week_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
     text = build_week_view(update.effective_chat.id, week_number)
     await update.message.reply_text(text, parse_mode="HTML")
+
+
+# --- image variants of /today, /week, plus /monthimage --------------------
+#
+# These reuse the same context builders (timetable_data) and render them to PNG
+# via the shared Playwright browser stashed in bot_data at startup. Only the
+# AnchorNotSetError case falls back to text; the templates themselves carry
+# graceful empty states ("~ no classes today ~", "~ free day ~", "No modules
+# scheduled this month"), so an otherwise-empty period still renders a proper
+# image rather than a blank one.
+
+_IMAGE_UNAVAILABLE_MESSAGE = (
+    "Image rendering isn't available right now — try the text view instead."
+)
+
+
+def _parse_month_arg(arg: str) -> int | None:
+    """A month number (1-12) or a full/abbreviated month name, or None if
+    neither. Case-insensitive."""
+    arg = arg.strip()
+    if arg.isdigit():
+        m = int(arg)
+        return m if 1 <= m <= 12 else None
+    low = arg.lower()
+    for i in range(1, 13):
+        if low in (calendar.month_name[i].lower(), calendar.month_abbr[i].lower()):
+            return i
+    return None
+
+
+async def dayimage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    browser = context.bot_data.get("browser")
+    if browser is None:
+        await update.message.reply_text(_IMAGE_UNAVAILABLE_MESSAGE)
+        return
+    tz = ZoneInfo(os.environ.get("TIMEZONE", "UTC"))
+    target = datetime.now(tz).date()
+    try:
+        png = await timetable_image.render_daily_image(browser, chat_id, target)
+    except scheduler.AnchorNotSetError:
+        await update.message.reply_text(scheduler.ANCHOR_NOT_SET_MESSAGE)
+        return
+    await context.bot.send_photo(chat_id, photo=png)
+
+
+async def weekimage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    browser = context.bot_data.get("browser")
+    if browser is None:
+        await update.message.reply_text(_IMAGE_UNAVAILABLE_MESSAGE)
+        return
+    week_number = None
+    if context.args:
+        try:
+            week_number = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text(
+                "Usage: /weekimage [week number], e.g. /weekimage 3"
+            )
+            return
+        if not 1 <= week_number <= _MAX_SEMESTER_WEEK:
+            await update.message.reply_text(
+                f"Week number must be between 1 and {_MAX_SEMESTER_WEEK}."
+            )
+            return
+    try:
+        png = await timetable_image.render_weekly_image(browser, chat_id, week_number)
+    except scheduler.AnchorNotSetError:
+        await update.message.reply_text(scheduler.ANCHOR_NOT_SET_MESSAGE)
+        return
+    await context.bot.send_photo(chat_id, photo=png)
+
+
+async def monthimage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    browser = context.bot_data.get("browser")
+    if browser is None:
+        await update.message.reply_text(_IMAGE_UNAVAILABLE_MESSAGE)
+        return
+    tz = ZoneInfo(os.environ.get("TIMEZONE", "UTC"))
+    today = datetime.now(tz).date()
+    year, month = today.year, today.month
+    if context.args:
+        parsed = _parse_month_arg(context.args[0])
+        if parsed is None:
+            await update.message.reply_text(
+                "Usage: /monthimage [month], e.g. /monthimage 9 or /monthimage September"
+            )
+            return
+        month = parsed
+    try:
+        png = await timetable_image.render_monthly_image(browser, chat_id, year, month)
+    except scheduler.AnchorNotSetError:
+        await update.message.reply_text(scheduler.ANCHOR_NOT_SET_MESSAGE)
+        return
+    await context.bot.send_photo(chat_id, photo=png)
 
 
 async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -375,6 +465,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Or use the menu buttons / commands below for quick navigation:\n"
         "/today -- today's classes, tasks and reminders\n"
         "/week -- this week's timetable (or /week 3 for a specific week)\n"
+        "/dayimage /weekimage /monthimage -- the same, as a picture\n"
         f"{keyboards.TASKS_LABEL} / /tasks -- view and update your tasks\n"
         f"{keyboards.REMINDERS_LABEL} / /reminders -- view and cancel upcoming reminders\n"
         f"{keyboards.TOPICS_LABEL} / /topics -- browse your topics and notes\n"

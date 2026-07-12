@@ -7,7 +7,7 @@ context.bot.send_message -- no thread bridging needed.
 
 import logging
 import os
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from telegram.ext import ContextTypes, JobQueue
@@ -58,6 +58,97 @@ def compute_week_number(anchor_date: date, target_date: date) -> int | None:
         return None
     wk = ((target_date - anchor_date).days // 7) + 1
     return wk if wk <= 13 else None
+
+
+WEEKDAY_CODES = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+
+
+def resolve_week_range(
+    anchor_date: date | None, today: date, week_number: int | None
+) -> tuple[date, date, int | None]:
+    """Resolve a (monday, sunday, week_label) triple for a week view.
+
+    With an explicit week_number, the Monday is derived from the anchor
+    (week 1 starts on the anchor); this only makes sense with an anchor set,
+    so anchor_date=None raises AnchorNotSetError. With week_number=None it's
+    the Monday..Sunday containing `today`, and the label is that week's
+    semester number if an anchor exists (else None).
+
+    Shared by commands.build_week_view and timetable_data.build_weekly_context
+    so a /week text view and its rendered image always cover the same range.
+    """
+    if week_number is not None:
+        if anchor_date is None:
+            raise AnchorNotSetError(ANCHOR_NOT_SET_MESSAGE)
+        monday = anchor_date + timedelta(days=7 * (week_number - 1))
+        wk_label: int | None = week_number
+    else:
+        monday = today - timedelta(days=today.weekday())  # Monday of this week
+        wk_label = compute_week_number(anchor_date, monday) if anchor_date else None
+    return monday, monday + timedelta(days=6), wk_label
+
+ANCHOR_NOT_SET_MESSAGE = (
+    "Set your semester start date first — tell me which date week 1 begins."
+)
+
+
+class AnchorNotSetError(Exception):
+    """Raised when a non-'every' schedule block must be resolved to a semester
+    week but no anchor is set for the chat yet -- so callers can surface a clear
+    prompt instead of silently showing or hiding the block."""
+
+
+def week_matches(week_pattern: str, week_number: int) -> bool:
+    """Whether a resolved semester week number satisfies a block's week_pattern.
+    Assumes week_pattern is already valid (validated at create time)."""
+    if week_pattern == "every":
+        return True
+    if week_pattern == "odd":
+        return week_number % 2 == 1
+    if week_pattern == "even":
+        return week_number % 2 == 0
+    return week_number in {int(p) for p in week_pattern.split(",")}
+
+
+def expand_occurrences(
+    blocks: list[dict], date_from: str, date_to: str, anchor_date: date | None
+) -> list[dict]:
+    """Expand recurring/one-off schedule blocks into concrete dated occurrences
+    within [date_from, date_to], applying each block's week_pattern.
+
+    The semester anchor is passed in (resolved once by the caller) rather than
+    re-queried here. Blocks with the default 'every' pattern never need it; a
+    non-'every' block with anchor_date=None is unresolvable, so we raise
+    AnchorNotSetError rather than guess whether it runs this week.
+    """
+    d_from = date.fromisoformat(date_from)
+    d_to = date.fromisoformat(date_to)
+
+    def _keep(candidate_date: date, block: dict) -> bool:
+        pattern = block.get("week_pattern") or "every"
+        if pattern == "every":
+            return True
+        if anchor_date is None:
+            raise AnchorNotSetError(ANCHOR_NOT_SET_MESSAGE)
+        wk = compute_week_number(anchor_date, candidate_date)
+        if wk is None:  # outside the semester -> the class doesn't run
+            return False
+        return week_matches(pattern, wk)
+
+    occurrences = []
+    for block in blocks:
+        if block["specific_date"] is not None:
+            block_date = date.fromisoformat(block["specific_date"])
+            if d_from <= block_date <= d_to and _keep(block_date, block):
+                occurrences.append({**block, "occurrence_date": block["specific_date"]})
+        else:
+            d = d_from
+            while d <= d_to:
+                if WEEKDAY_CODES[d.weekday()] == block["day_of_week"] and _keep(d, block):
+                    occurrences.append({**block, "occurrence_date": d.isoformat()})
+                d += timedelta(days=1)
+    occurrences.sort(key=lambda o: (o["occurrence_date"], o["start_time"]))
+    return occurrences
 
 
 def schedule_reminder(

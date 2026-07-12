@@ -2,7 +2,7 @@
 
 import logging
 import os
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from typing import Callable
 from zoneinfo import ZoneInfo
 
@@ -10,17 +10,6 @@ import database
 import scheduler
 
 logger = logging.getLogger(__name__)
-
-ANCHOR_NOT_SET_MESSAGE = (
-    "Set your semester start date first — tell me which date week 1 begins."
-)
-
-
-class AnchorNotSetError(Exception):
-    """Raised when a non-'every' schedule block must be resolved to a semester
-    week but no anchor is set for the chat yet -- so we surface a clear prompt
-    instead of silently showing or hiding the block."""
-
 
 TOOL_SCHEMAS = [
     {
@@ -775,59 +764,7 @@ def _handle_query_notes(tool_input: dict, chat_id: int, job_queue) -> str:
     return "\n".join(lines)
 
 
-_WEEKDAY_CODES = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
 _MAX_SCHEDULE_QUERY_DAYS = 90
-
-
-def _week_matches(week_pattern: str, week_number: int) -> bool:
-    """Whether a resolved semester week number satisfies a block's week_pattern.
-    Assumes week_pattern is already valid (validated at create time)."""
-    if week_pattern == "every":
-        return True
-    if week_pattern == "odd":
-        return week_number % 2 == 1
-    if week_pattern == "even":
-        return week_number % 2 == 0
-    return week_number in {int(p) for p in week_pattern.split(",")}
-
-
-def _expand_occurrences(
-    blocks: list[dict], date_from: str, date_to: str, chat_id: int
-) -> list[dict]:
-    d_from = date.fromisoformat(date_from)
-    d_to = date.fromisoformat(date_to)
-
-    # Resolve the semester anchor once. Blocks with the default 'every' pattern
-    # never need it; a non-'every' block with no anchor set is unresolvable, so
-    # we raise rather than guess whether it runs this week.
-    anchor_str = database.get_semester_anchor(chat_id)
-    anchor_date = date.fromisoformat(anchor_str) if anchor_str else None
-
-    def _keep(candidate_date: date, block: dict) -> bool:
-        pattern = block.get("week_pattern") or "every"
-        if pattern == "every":
-            return True
-        if anchor_date is None:
-            raise AnchorNotSetError(ANCHOR_NOT_SET_MESSAGE)
-        wk = scheduler.compute_week_number(anchor_date, candidate_date)
-        if wk is None:  # outside the semester -> the class doesn't run
-            return False
-        return _week_matches(pattern, wk)
-
-    occurrences = []
-    for block in blocks:
-        if block["specific_date"] is not None:
-            block_date = date.fromisoformat(block["specific_date"])
-            if d_from <= block_date <= d_to and _keep(block_date, block):
-                occurrences.append({**block, "occurrence_date": block["specific_date"]})
-        else:
-            d = d_from
-            while d <= d_to:
-                if _WEEKDAY_CODES[d.weekday()] == block["day_of_week"] and _keep(d, block):
-                    occurrences.append({**block, "occurrence_date": d.isoformat()})
-                d += timedelta(days=1)
-    occurrences.sort(key=lambda o: (o["occurrence_date"], o["start_time"]))
-    return occurrences
 
 
 def _handle_create_schedule_block(tool_input: dict, chat_id: int, job_queue) -> str:
@@ -870,10 +807,14 @@ def _handle_query_schedule(tool_input: dict, chat_id: int, job_queue) -> str:
         blocks = database.list_schedule_blocks(
             chat_id=chat_id, date_from=date_from, date_to=date_to, module_name=module_name
         )
+        anchor = database.get_semester_anchor(chat_id)
+        anchor_date = date.fromisoformat(anchor) if anchor else None
         try:
-            occurrences = _expand_occurrences(blocks, date_from, date_to, chat_id)
-        except AnchorNotSetError:
-            return ANCHOR_NOT_SET_MESSAGE
+            occurrences = scheduler.expand_occurrences(
+                blocks, date_from, date_to, anchor_date
+            )
+        except scheduler.AnchorNotSetError:
+            return scheduler.ANCHOR_NOT_SET_MESSAGE
         if not occurrences:
             return "No schedule blocks in that range."
         lines = []

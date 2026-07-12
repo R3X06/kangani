@@ -21,13 +21,20 @@ HISTORY_LIMIT = 20  # ~10 turns, trimmed after each response
 _client: AsyncAnthropic | None = None
 
 
-def _get_client() -> AsyncAnthropic:
+def get_client() -> AsyncAnthropic:
     # Built lazily instead of at import time, so it's not created before
     # bot.py's load_dotenv() has populated ANTHROPIC_API_KEY into os.environ.
+    # Public so other modules (e.g. pdf_import) can reuse the single client
+    # rather than each building their own.
     global _client
     if _client is None:
         _client = AsyncAnthropic()
     return _client
+
+
+def _get_client() -> AsyncAnthropic:
+    # Backwards-compatible alias for internal callers.
+    return get_client()
 
 
 def build_system_prompt(chat_id: int) -> str:

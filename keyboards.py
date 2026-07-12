@@ -159,6 +159,21 @@ def topic_notes_keyboard(topic_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def pdf_import_confirm_keyboard(import_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Import", callback_data=f"pdfimport:confirm:{import_id}"
+                ),
+                InlineKeyboardButton(
+                    "❌ Cancel", callback_data=f"pdfimport:cancel:{import_id}"
+                ),
+            ]
+        ]
+    )
+
+
 def event_list_keyboard(events: list[dict]) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(e["title"], callback_data=f"event:open:{e['id']}")]

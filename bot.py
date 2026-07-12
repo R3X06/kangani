@@ -20,6 +20,7 @@ import callbacks
 import commands
 import database
 import keyboards
+import pdf_import
 import scheduler
 
 logging.basicConfig(
@@ -32,6 +33,9 @@ BOT_COMMANDS = [
     BotCommand("menu", "Show the quick-access menu"),
     BotCommand("today", "Today's classes, tasks and reminders"),
     BotCommand("week", "This week's timetable"),
+    BotCommand("dayimage", "Today's timetable as an image"),
+    BotCommand("weekimage", "This week's timetable as an image"),
+    BotCommand("monthimage", "This month's timetable as an image"),
     BotCommand("tasks", "View and update your tasks"),
     BotCommand("reminders", "View and cancel upcoming reminders"),
     BotCommand("topics", "Browse your topics and notes"),
@@ -46,7 +50,34 @@ async def post_init(application: Application) -> None:
     database.init_db()
     scheduler.reschedule_pending_reminders(application.job_queue)
     await application.bot.set_my_commands(BOT_COMMANDS)
+
+    # Launch one headless Chromium for the bot's lifetime -- cold-launching per
+    # image request would make every /dayimage etc. noticeably slow. If it fails
+    # (e.g. `playwright install chromium` hasn't been run), the bot still starts;
+    # the image commands just report themselves unavailable.
+    try:
+        from playwright.async_api import async_playwright
+
+        pw = await async_playwright().start()
+        application.bot_data["playwright"] = pw
+        application.bot_data["browser"] = await pw.chromium.launch()
+        logger.info("Playwright Chromium launched for timetable images.")
+    except Exception:
+        logger.exception(
+            "Failed to launch Playwright Chromium -- image commands will be "
+            "unavailable. Have you run `playwright install chromium`?"
+        )
+
     logger.info("Kangani initialized: database ready, reminders rescheduled.")
+
+
+async def post_shutdown(application: Application) -> None:
+    browser = application.bot_data.get("browser")
+    if browser is not None:
+        await browser.close()
+    pw = application.bot_data.get("playwright")
+    if pw is not None:
+        await pw.stop()
 
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -94,12 +125,16 @@ def main() -> None:
         ApplicationBuilder()
         .token(token)
         .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .build()
     )
 
     application.add_handler(CommandHandler("start", start_handler))
     application.add_handler(CommandHandler("today", commands.today_command))
     application.add_handler(CommandHandler("week", commands.week_command))
+    application.add_handler(CommandHandler("dayimage", commands.dayimage_command))
+    application.add_handler(CommandHandler("weekimage", commands.weekimage_command))
+    application.add_handler(CommandHandler("monthimage", commands.monthimage_command))
     application.add_handler(CommandHandler("tasks", commands.tasks_command))
     application.add_handler(CommandHandler("reminders", commands.reminders_command))
     application.add_handler(CommandHandler("topics", commands.topics_command))
@@ -108,6 +143,10 @@ def main() -> None:
     application.add_handler(CommandHandler("menu", commands.menu_command))
     application.add_handler(CommandHandler("help", commands.help_command))
     application.add_handler(CommandHandler("settings", commands.settings_command))
+
+    # PDF uploads (schedule import) -- registered before the catch-all text
+    # handler so a document upload is routed here, not into brain.get_response().
+    application.add_handler(MessageHandler(filters.Document.PDF, pdf_import.handle_pdf_upload))
 
     # Nav-button presses arrive as plain text -- this handler is registered
     # BEFORE the catch-all so PTB routes matching button labels here first,
@@ -119,6 +158,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(callbacks.reminder_callback, pattern=r"^rem:"))
     application.add_handler(CallbackQueryHandler(callbacks.topic_callback, pattern=r"^topic:"))
     application.add_handler(CallbackQueryHandler(callbacks.event_callback, pattern=r"^event:"))
+    application.add_handler(CallbackQueryHandler(callbacks.pdf_import_callback, pattern=r"^pdfimport:"))
 
     application.add_error_handler(error_handler)
 

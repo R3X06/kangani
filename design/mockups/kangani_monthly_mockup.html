@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Kangani — Monthly</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Caveat:wght@600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --paper:#FBF3E4; --card:#F3E8D3; --ink:#33291F; --ink-soft:#6B5D4C; --rule:#D9C9AC;
+    --m-sc2001:#B5646B; --m-sc3000:#748264; --m-sc3103:#5E7A93; --m-hw0288:#C79A44;
+    --m-sc2079:#8C5B7C; --m-aaa28j:#4F8074; --m-bu5201:#A8763E; --m-bu5401:#9B5A5A;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  body{
+    width:1080px; background:var(--paper); color:var(--ink);
+    font-family:'Inter',sans-serif; padding:64px 56px 72px;
+    background-image: radial-gradient(circle at 1px 1px, rgba(51,41,31,0.035) 1px, transparent 0);
+    background-size: 14px 14px;
+  }
+  .head h1{font-family:'Caveat',cursive; font-weight:700; font-size:80px; line-height:1;}
+  .head p{font-size:20px; color:var(--ink-soft); margin-top:2px; margin-bottom:36px;}
+  .grid{display:grid; grid-template-columns:repeat(7,1fr); gap:10px;}
+  .dow{text-align:center; font-size:13px; letter-spacing:0.08em; color:var(--ink-soft);
+       font-weight:600; padding-bottom:10px; text-transform:uppercase;}
+  .dow.weekend{color:#A99C86;}
+  .cell{background:var(--card); border-radius:12px; padding:12px; height:118px; position:relative;}
+  .cell.blank{background:transparent;}
+  .cell.weekend{background:#F7EEDC;}
+  .datenum{font-size:16px; font-weight:500; color:var(--ink-soft);}
+  .cell.weekend .datenum{color:#A99C86;}
+  .cell.today .datenum{color:var(--ink); position:relative; z-index:1;}
+  .cell.today::before{content:""; position:absolute; left:9px; top:8px; width:30px; height:30px;
+       border:2px solid var(--ink); border-radius:50%; transform:rotate(-6deg);}
+  .marks{position:absolute; bottom:11px; left:12px; right:12px; display:flex; flex-wrap:wrap; gap:6px;}
+  .flag{position:absolute; bottom:10px; right:12px; width:14px; height:14px;}
+  .legend{margin-top:34px; padding-top:24px; border-top:1px solid var(--rule);}
+  .legend h3{font-family:'Caveat',cursive; font-size:28px; font-weight:700; margin-bottom:14px;}
+  .mods{display:flex; flex-wrap:wrap; row-gap:10px; column-gap:24px; margin-bottom:22px;}
+  .mods .item{display:flex; align-items:center; gap:8px; font-size:14px; color:var(--ink-soft);}
+  .mods .swatch{width:11px; height:11px; border-radius:50%; flex-shrink:0;}
+  .shapes{display:flex; flex-wrap:wrap; gap:32px; font-size:14px; color:var(--ink-soft); align-items:center;}
+  .shapes .item{display:flex; align-items:center; gap:9px;}
+</style>
+</head>
+<body>
+
+<div class="head">
+  <h1>August</h1>
+  <p>2026</p>
+</div>
+
+<div class="grid">
+  <div class="dow weekend">Sun</div><div class="dow">Mon</div><div class="dow">Tue</div>
+  <div class="dow">Wed</div><div class="dow">Thu</div><div class="dow">Fri</div><div class="dow weekend">Sat</div>
+
+  <!-- Row 1: Aug 1 2026 is a Saturday -->
+  <div class="cell blank"></div><div class="cell blank"></div><div class="cell blank"></div>
+  <div class="cell blank"></div><div class="cell blank"></div><div class="cell blank"></div>
+  <div class="cell weekend"><span class="datenum">1</span></div>
+
+  <!-- Row 2: 2 (Sun) - 8 (Sat) -- all pre-semester, no markers -->
+  <div class="cell weekend"><span class="datenum">2</span></div>
+  <div class="cell"><span class="datenum">3</span></div>
+  <div class="cell"><span class="datenum">4</span></div>
+  <div class="cell"><span class="datenum">5</span></div>
+  <div class="cell"><span class="datenum">6</span></div>
+  <div class="cell"><span class="datenum">7</span></div>
+  <div class="cell weekend"><span class="datenum">8</span></div>
+
+  <!-- Row 3: 9 (Sun) - 15 (Sat) -- week 1 (Mon 10 - Sun 16) -->
+  <div class="cell weekend"><span class="datenum">9</span></div>
+
+  <div class="cell">
+    <span class="datenum">10</span>
+    <div class="marks">
+      <svg width="10" height="10"><circle cx="5" cy="5" r="5" fill="var(--m-sc3000)"/></svg>
+      <svg width="10" height="10"><circle cx="5" cy="5" r="5" fill="var(--m-sc2001)"/></svg>
+      <svg width="10" height="10"><path d="M5 0 L10 5 L5 10 L0 5 Z" fill="var(--m-sc3103)"/></svg>
+      <svg width="10" height="10"><path d="M5 0 L10 5 L5 10 L0 5 Z" fill="var(--m-bu5401)"/></svg>
+    </div>
+  </div>
+
+  <div class="cell"><span class="datenum">11</span></div>
+
+  <div class="cell today"><span class="datenum">12</span></div>
+
+  <div class="cell">
+    <span class="datenum">13</span>
+    <div class="marks">
+      <svg width="10" height="10"><circle cx="5" cy="5" r="5" fill="var(--m-aaa28j)"/></svg>
+      <svg width="12" height="12" viewBox="0 0 12 12"><g stroke="var(--m-sc2001)" stroke-width="1.8" stroke-linecap="round"><line x1="6" y1="1" x2="6" y2="11"/><line x1="1.5" y1="3.5" x2="10.5" y2="8.5"/><line x1="10.5" y1="3.5" x2="1.5" y2="8.5"/></g></svg>
+    </div>
+    <svg class="flag" viewBox="0 0 14 14"><path d="M2 1v12M2 1h8l-2 3 2 3H2" fill="none" stroke="#C79A44" stroke-width="1.6" stroke-linejoin="round"/></svg>
+  </div>
+
+  <div class="cell">
+    <span class="datenum">14</span>
+    <div class="marks">
+      <svg width="10" height="10"><circle cx="5" cy="5" r="5" fill="var(--m-sc2079)"/></svg>
+      <svg width="12" height="12" viewBox="0 0 12 12"><g stroke="var(--m-sc2079)" stroke-width="1.8" stroke-linecap="round"><line x1="6" y1="1" x2="6" y2="11"/><line x1="1.5" y1="3.5" x2="10.5" y2="8.5"/><line x1="10.5" y1="3.5" x2="1.5" y2="8.5"/></g></svg>
+      <svg width="10" height="10"><circle cx="5" cy="5" r="5" fill="var(--m-sc3103)"/></svg>
+    </div>
+  </div>
+
+  <div class="cell weekend"><span class="datenum">15</span></div>
+
+  <!-- Row 4: 16 (Sun) - 22 (Sat) -- week 2 (Mon 17 - Sun 23) -->
+  <div class="cell weekend"><span class="datenum">16</span></div>
+
+  <div class="cell">
+    <span class="datenum">17</span>
+    <div class="marks">
+      <svg width="10" height="10"><circle cx="5" cy="5" r="5" fill="var(--m-sc3000)"/></svg>
+      <svg width="10" height="10"><circle cx="5" cy="5" r="5" fill="var(--m-sc2001)"/></svg>
+      <svg width="10" height="10"><path d="M5 0 L10 5 L5 10 L0 5 Z" fill="var(--m-sc3103)"/></svg>
+      <svg width="10" height="10"><path d="M5 0 L10 5 L5 10 L0 5 Z" fill="var(--m-bu5401)"/></svg>
+    </div>
+  </div>
+  <div class="cell">
+    <span class="datenum">18</span>
+    <div class="marks">
+      <svg width="12" height="4"><rect width="12" height="4" rx="2" fill="var(--m-sc3103)"/></svg>
+    </div>
+  </div>
+  <div class="cell">
+    <span class="datenum">19</span>
+    <div class="marks">
+      <svg width="10" height="10"><path d="M5 0 L10 5 L5 10 L0 5 Z" fill="var(--m-bu5201)"/></svg>
+      <svg width="10" height="10"><circle cx="5" cy="5" r="5" fill="var(--m-sc2001)"/></svg>
+    </div>
+  </div>
+  <div class="cell">
+    <span class="datenum">20</span>
+    <div class="marks">
+      <svg width="10" height="10"><circle cx="5" cy="5" r="5" fill="var(--m-aaa28j)"/></svg>
+      <svg width="12" height="12" viewBox="0 0 12 12"><g stroke="var(--m-sc2001)" stroke-width="1.8" stroke-linecap="round"><line x1="6" y1="1" x2="6" y2="11"/><line x1="1.5" y1="3.5" x2="10.5" y2="8.5"/><line x1="10.5" y1="3.5" x2="1.5" y2="8.5"/></g></svg>
+    </div>
+  </div>
+  <div class="cell">
+    <span class="datenum">21</span>
+    <div class="marks">
+      <svg width="10" height="10"><circle cx="5" cy="5" r="5" fill="var(--m-sc2079)"/></svg>
+      <svg width="12" height="12" viewBox="0 0 12 12"><g stroke="var(--m-sc2079)" stroke-width="1.8" stroke-linecap="round"><line x1="6" y1="1" x2="6" y2="11"/><line x1="1.5" y1="3.5" x2="10.5" y2="8.5"/><line x1="10.5" y1="3.5" x2="1.5" y2="8.5"/></g></svg>
+      <svg width="10" height="10"><circle cx="5" cy="5" r="5" fill="var(--m-sc3103)"/></svg>
+    </div>
+  </div>
+  <div class="cell weekend"><span class="datenum">22</span></div>
+
+  <!-- Row 5: 23 (Sun), 24 (Mon) -- week 3 -->
+  <div class="cell weekend"><span class="datenum">23</span></div>
+  <div class="cell">
+    <span class="datenum">24</span>
+    <div class="marks">
+      <svg width="10" height="10"><circle cx="5" cy="5" r="5" fill="var(--m-sc3000)"/></svg>
+      <svg width="10" height="10"><circle cx="5" cy="5" r="5" fill="var(--m-sc2001)"/></svg>
+      <svg width="10" height="10"><path d="M5 0 L10 5 L5 10 L0 5 Z" fill="var(--m-sc3103)"/></svg>
+      <svg width="10" height="10"><path d="M5 0 L10 5 L5 10 L0 5 Z" fill="var(--m-bu5401)"/></svg>
+    </div>
+  </div>
+  <div class="cell blank"></div><div class="cell blank"></div><div class="cell blank"></div>
+  <div class="cell blank"></div><div class="cell blank"></div>
+</div>
+
+<div class="legend">
+  <h3>Modules</h3>
+  <div class="mods">
+    <span class="item"><span class="swatch" style="background:var(--m-sc2001)"></span>SC2001 — Algorithms &amp; Design</span>
+    <span class="item"><span class="swatch" style="background:var(--m-sc3000)"></span>SC3000 — Artificial Intelligence</span>
+    <span class="item"><span class="swatch" style="background:var(--m-sc3103)"></span>SC3103 — Embedded Programming</span>
+    <span class="item"><span class="swatch" style="background:var(--m-hw0288)"></span>HW0288 — Engineering Communication</span>
+    <span class="item"><span class="swatch" style="background:var(--m-sc2079)"></span>SC2079 — Multidisciplinary Design</span>
+    <span class="item"><span class="swatch" style="background:var(--m-aaa28j)"></span>AAA28J — Digital Media &amp; Visual Arts</span>
+    <span class="item"><span class="swatch" style="background:var(--m-bu5201)"></span>BU5201 — Business Finance</span>
+    <span class="item"><span class="swatch" style="background:var(--m-bu5401)"></span>BU5401 — Mgmt Decision Tools</span>
+  </div>
+  <div class="shapes">
+    <span class="item"><svg width="10" height="10"><circle cx="5" cy="5" r="5" fill="#6B5D4C"/></svg> Lecture</span>
+    <span class="item"><svg width="12" height="4"><rect width="12" height="4" rx="2" fill="#6B5D4C"/></svg> Tutorial</span>
+    <span class="item"><svg width="12" height="12" viewBox="0 0 12 12"><g stroke="#6B5D4C" stroke-width="1.8" stroke-linecap="round"><line x1="6" y1="1" x2="6" y2="11"/><line x1="1.5" y1="3.5" x2="10.5" y2="8.5"/><line x1="10.5" y1="3.5" x2="1.5" y2="8.5"/></g></svg> Lab</span>
+    <span class="item"><svg width="10" height="10"><path d="M5 0 L10 5 L5 10 L0 5 Z" fill="#6B5D4C"/></svg> Seminar / other</span>
+    <span class="item"><svg width="12" height="12" viewBox="0 0 14 14"><path d="M2 1v12M2 1h8l-2 3 2 3H2" fill="none" stroke="#C79A44" stroke-width="1.6" stroke-linejoin="round"/></svg> Task deadline</span>
+  </div>
+</div>
+
+</body>
+</html>

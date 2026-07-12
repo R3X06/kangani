@@ -6,6 +6,7 @@ reminders) directly -- never through tools.py, which is shaped for the
 Claude tool-use protocol, not Telegram message editing.
 """
 
+import logging
 from datetime import datetime, timedelta, timezone
 
 from telegram import Update
@@ -15,6 +16,8 @@ import commands
 import database
 import keyboards
 import scheduler
+
+logger = logging.getLogger(__name__)
 
 
 def _queue_nav_note(context: ContextTypes.DEFAULT_TYPE, note: str) -> None:
@@ -178,6 +181,107 @@ async def topic_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         await query.edit_message_text(text, reply_markup=kb)
+        await query.answer()
+    except (IndexError, ValueError, KeyError):
+        await query.answer("Something went wrong with that button.", show_alert=True)
+
+
+def _entry_label(e: dict) -> str:
+    bits = [
+        e.get("course_code") or "?",
+        e.get("class_type") or "",
+        e.get("day_of_week") or "",
+        e.get("start_time") or "",
+    ]
+    return " ".join(b for b in bits if b).strip()
+
+
+async def pdf_import_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    chat_id = update.effective_chat.id
+
+    try:
+        parts = query.data.split(":")
+        action = parts[1]
+        import_id = parts[2]
+
+        # pop() -- confirming or cancelling consumes the stash so a double-tap
+        # can't import twice.
+        result = context.chat_data.get("pending_pdf_import", {}).pop(import_id, None)
+        if result is None:
+            await query.edit_message_text(
+                "This import has expired or was already handled. Re-upload the PDF to try again."
+            )
+            await query.answer()
+            return
+
+        if action == "cancel":
+            await query.edit_message_text("Import cancelled — nothing was saved.")
+            await query.answer()
+            return
+
+        # action == "confirm"
+        title_by_code = {
+            c.get("course_code"): c.get("title")
+            for c in result["courses"]
+            if c.get("course_code")
+        }
+        created = 0
+        skipped = 0
+        failed: list[str] = []
+
+        for e in result["schedule_entries"]:
+            label = _entry_label(e)
+            if e.get("needs_review"):
+                failed.append(
+                    f"{label} — unreadable week label '{e.get('week_label_raw')}'"
+                )
+                continue
+            try:
+                code = e.get("course_code")
+                module_name = (title_by_code.get(code) or code or "").strip()
+                if not module_name:
+                    failed.append(f"{label} — no course code")
+                    continue
+                module = database.get_or_create_module(chat_id, module_name)
+                if database.find_matching_schedule_block(
+                    chat_id,
+                    module["id"],
+                    e.get("day_of_week"),
+                    e.get("start_time"),
+                    e.get("end_time"),
+                    e.get("class_type"),
+                ):
+                    skipped += 1
+                    continue
+                database.create_schedule_block(
+                    chat_id=chat_id,
+                    start_time=e.get("start_time"),
+                    end_time=e.get("end_time"),
+                    day_of_week=e.get("day_of_week"),
+                    module_name=module_name,
+                    class_type=e.get("class_type"),
+                    location=e.get("location"),
+                    week_pattern=e.get("week_pattern", "every"),
+                )
+                created += 1
+            except Exception as exc:
+                logger.exception("Failed to import a schedule entry")
+                failed.append(f"{label} — {exc}")
+
+        summary = [
+            f"Import complete: {created} created, {skipped} skipped (already existed)."
+        ]
+        if failed:
+            summary.append("")
+            summary.append(f"{len(failed)} could not be imported:")
+            summary.extend(f"• {f}" for f in failed)
+        await query.edit_message_text("\n".join(summary))
+        _queue_nav_note(
+            context,
+            f"User imported a schedule PDF: {created} classes created, "
+            f"{skipped} skipped, {len(failed)} failed.",
+        )
         await query.answer()
     except (IndexError, ValueError, KeyError):
         await query.answer("Something went wrong with that button.", show_alert=True)

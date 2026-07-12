@@ -1,51 +1,60 @@
-# Kangani — Prompt: Semester Week Anchor, Alternating Weeks, /today and /week
+# Kangani — Prompt: Cleanup + PDF Schedule Import
 
-Start in **Plan mode**. Present the plan (files touched, function signatures, migration approach) before writing any code, so I can review it before you move to Edit mode.
+Start in **Plan mode**. Present the plan (files touched, function signatures, new dependencies) before writing any code, so I can review it before you move to Edit mode.
 
-## Context
+## 0. Cleanup from the /today /week session (small, do first)
 
-`schedule_blocks` currently has no concept of "which semester week is this." Some classes run every week, others alternate (e.g. `Wk2,4,6,8,10,12`), and the only way to know is a human reading the label. Kangani needs to compute this itself so `/today` and `/week` only show classes that actually happen. This requires one anchor: the calendar date that week 1 starts on (e.g. "August 13th is week 1"). Everything else derives from that.
+Two minor things from the last commit (`8b2d6f7`), neither broken, both worth tightening while you're in this code:
 
-`/today` and `/week` are **deterministic slash commands**, not LLM tool calls — same pattern as `/tasks` and `/reminders` in `commands.py`. No Claude round-trip needed for a fixed-format render.
+1. **`commands.py` reaches into `tools._expand_occurrences` directly** — an underscore-prefixed "private" function in another module. Promote it to a proper shared helper: move `_expand_occurrences` (and the `_week_matches` helper it uses) out of `tools.py` into `scheduler.py` alongside `compute_week_number`, drop the leading underscore, and have both `tools.py` and `commands.py` import it from there. `AnchorNotSetError` and `ANCHOR_NOT_SET_MESSAGE` move with it.
+2. **Redundant anchor fetch** — `build_today_view`/`build_week_view` in `commands.py` and the (now-relocated) occurrence-expansion helper each independently call `get_semester_anchor`. Fetch it once per view function and pass the resolved `anchor_date` down instead of re-querying.
 
-## 1. Schema changes (`database.py`)
+Small enough that if your plan finds a cleaner shape for either of these, go with it — the point is removing the layering crack and the duplicate query, not matching my wording exactly.
 
-- New table `chat_settings`: `chat_id INTEGER PRIMARY KEY`, `semester_week1_start_date TEXT` (a plain `YYYY-MM-DD`, no time component — it's a calendar anchor, not an instant). One row per chat. Kept as its own small table (rather than crammed into an existing one) since more settings will likely land here later (roadmap mentions energy-aware scheduling, etc.) — extensible without another migration.
-- `schedule_blocks` gains `week_pattern TEXT NOT NULL DEFAULT 'every'`. Add it the same additive, non-destructive way `class_type` was added last time (`_ensure_column`, not a version-bump recreate — this one doesn't need to touch existing rows' data, just add a column with a safe default). Valid values: `'every'`, `'odd'`, `'even'`, or an explicit comma-separated list of week numbers (e.g. `'1,3,5,7,9,11,13'`). Validate the format in `create_schedule_block` and raise `ValueError` on anything else.
+## Context for the import feature
 
-## 2. Data-layer changes
+The registration PDFs NTU issues (like the one I sent you) use Type 3 embedded fonts with custom encoding — `pdftotext`-style extraction comes out as garbage on these (I hit this myself checking the file: readable when rasterized and viewed, unreadable as extracted text). So this import has to rasterize each page to an image and read it visually via a Claude vision call, not parse the text layer.
 
-- `set_semester_anchor(chat_id, start_date)` / `get_semester_anchor(chat_id)` in `database.py` — upsert/read the single row in `chat_settings`.
-- New helper `compute_week_number(anchor_date: date, target_date: date) -> int | None` (put it in `scheduler.py`, next to the other date/time utilities) — `((target_date - anchor_date).days // 7) + 1`, clamped to `1..13`; return `None` if `target_date` is before the anchor or the computed number exceeds 13 (outside the semester).
-- `create_schedule_block(..., week_pattern='every')` — pass through and validate.
-- `_expand_occurrences` in `tools.py` needs a week_pattern filter step: for each candidate occurrence, resolve the semester week number for its date via `get_semester_anchor` + `compute_week_number`, then keep it only if `week_pattern` is `'every'`, matches odd/even parity, or the resolved week number is in the explicit list. **If no anchor is set for this chat yet, don't silently show everything or silently hide everything** — surface a clear message ("Set your semester start date first — tell me which date week 1 begins") instead of guessing.
+Two sections per PDF matter: the **registered/waitlist course list** (code, title, index no., AU, status) and the **weekly timetable grid** (day × time cells containing class type, module, location, and a week-range label like `Wk2-13`, `Wk1,3,5,7,9,11,13`, or no label at all meaning every week).
 
-## 3. Tools & brain.py
+## 1. Dependencies
 
-- New tool schema `set_semester_start(start_date)` — Claude calls this when the user tells it which date week 1 begins (e.g. "week 1 starts August 13th," "the week of Aug 13 is week 1"). Idempotent — calling it again just updates the anchor.
-- System prompt addition: explain the anchor's purpose in one or two sentences, and instruct Claude to ask for it (once, not repeatedly) if the user tries to create a schedule block with a non-`'every'` `week_pattern` and no anchor is set yet for this chat.
+Add `pdf2image` to `requirements.txt` (wraps `poppler-utils` for rasterizing PDF pages to images — cleaner than shelling out to `pdftoppm` directly). Note in your plan that the deployment environment needs `poppler-utils` installed at the OS level (`apt install poppler-utils` on Debian/Ubuntu) — `pdf2image` alone won't work without it. Flag this as a setup step for me, don't try to install system packages yourself.
 
-## 4. `/today` and `/week` commands
+## 2. Telegram document handler (`bot.py`)
 
-Both render a single Telegram message using `parse_mode="HTML"` with the whole body wrapped in `<pre>...</pre>` for monospace alignment — **HTML-escape every piece of dynamic text** (module titles, locations, task titles, reminder messages) before interpolating, since raw `<`/`>`/`&` in user content would otherwise break Telegram's HTML parser.
+- New `MessageHandler(filters.Document.PDF, pdf_import.handle_pdf_upload)`, registered before the catch-all text handler.
+- Reject anything over a reasonable size cap (e.g. 15 MB) with a friendly message instead of attempting to process it.
+- Download to a temp path via PTB's `File.download_to_drive` (use a per-upload temp dir, clean it up after processing — don't leave uploaded PDFs sitting on disk).
 
-**`build_today_view(chat_id) -> str`** (`commands.py`):
-- Resolve today's local date (`TIMEZONE` env, same convention as everywhere else) and its semester week number (blank/omitted header if no anchor set — don't block the rest of the view on it).
-- Section 1: today's classes — expand `schedule_blocks` for today's single-day range through the existing `_expand_occurrences` (now week_pattern-aware), sorted by `start_time`.
-- Section 2: tasks whose `deadline` falls today (reuse `query_tasks` with `deadline_from`/`deadline_to` both set to today's UTC bounds).
-- Section 3: reminders whose `trigger_data` falls today (new small query or filter over `list_pending_reminders`).
-- Omit a section entirely (not just "none") when it's empty, except classes — keep "No classes today" if the schedule section would otherwise be blank, since that's the primary reason someone runs `/today`.
+## 3. Parsing pipeline (new `pdf_import.py`)
 
-**`build_week_view(chat_id, week_number=None) -> str`** (`commands.py`):
-- If `week_number` is given, resolve its Monday–Sunday date range from the anchor; if omitted, use the current calendar week. If no anchor is set and `week_number` was requested, return the same "set your semester start date" message as above.
-- Expand occurrences across the 7-day range (week_pattern-aware), group by day, render each day as a header + indented time/class/location lines, or "— nothing" if empty. Match the mockup's layout (day header line, `HH:MM Title - Location` rows, blank day fallback text) — I approved that format already, so mirror it exactly rather than reinterpreting it.
+- Rasterize each page via `pdf2image.convert_from_path` at ~150 DPI (matches what worked when I checked your file). Cap processing at the first 5 pages — warn the user if the PDF has more and only the first 5 were read.
+- For each page image, make a **separate, one-shot Anthropic API call** (its own small client call, not routed through `brain.py`'s tool-use loop — this is a fixed extraction task, not a conversation) with the image as base64 input and a system prompt instructing Claude to respond with **JSON only**, extracting:
+  - `courses`: `course_code`, `title`, `index_no`, `au`, `status` (`Registered`/`Waitlist`)
+  - `schedule_entries`: `course_code`, `class_type` (map `LEC/STU`→`Lecture`, `TUT`→`Tutorial`, `LAB`→`Lab`, `SEM`→`Seminar`, `DES`→`Design`, `PRJ`→`Project`, using the legend on the PDF itself where present), `day_of_week` (MON–SUN), `start_time`, `end_time` (24-hour `HH:MM`), `location`, `week_label_raw` (the literal printed string, e.g. `"Wk2-13"`, `"Wk1,3,5,7,9,11,13"`, or `null` if no week label appears in the cell).
+- **Do the week-label normalization in Python, not in the LLM call.** The vision call's only job is faithful transcription of what's printed — turning `"Wk2-13"` into the correct `week_pattern` string is arithmetic Kangani's own code should own, not something to trust a vision model to get right silently. Write `normalize_week_label(raw: str | None) -> str`:
+  - `None` → `'every'`
+  - a single number (`"Wk1"`) → that number as a string (`'1'`)
+  - a comma list (`"Wk1,3,5,7,9,11,13"`) → passed through as the comma list (already valid `week_pattern` format)
+  - a range (`"Wk2-13"`) → expand to the full comma-separated list `'2,3,4,5,6,7,8,9,10,11,12,13'`
+  - anything unparseable → raise, and have the caller flag that one entry as needing manual review rather than guessing
+- Merge results across pages into one extraction result: `{courses: [...], schedule_entries: [...]}`. A single time cell can hold multiple entries (I saw this in your PDF — a lecture and a lab stacked in the same slot); each becomes its own `schedule_entries` row, not merged.
 
-Thin handlers + registration:
-- `today_command`, `week_command` in `commands.py` (the latter parses an optional integer arg from `context.args` for an explicit week number).
-- Register both in `bot.py`: `CommandHandler("today", commands.today_command)`, `CommandHandler("week", commands.week_command)`, plus `BotCommand` entries in `BOT_COMMANDS` so they show in Telegram's `/` menu.
+## 4. Confirm-before-commit flow
+
+Don't write anything to the database until the user confirms — a misread here writes wrong class times, which is worse than the current manual-entry status quo.
+
+- After parsing, render a preview message: counts (`N courses found — X registered, Y waitlisted`, `Z weekly class blocks found`), then a compact list of the schedule entries grouped by day (reuse the day-header + indented-row style `build_week_view` already established, for visual consistency).
+- Stash the parsed result in `context.chat_data['pending_pdf_import']` (same pattern as the existing `pending_nav_notes` stash in `bot.py`) keyed by a short generated id, so confirming doesn't require re-parsing the PDF.
+- Inline keyboard: `✅ Import` / `❌ Cancel` → new `callbacks.py` handler `pdf_import_callback` (`pattern=r"^pdfimport:"`), registered in `bot.py`.
+  - **Confirm**: for each course, `get_or_create_module`; for each schedule entry, `create_schedule_block` with the normalized `week_pattern`. Before inserting, check for an existing block with the same `chat_id`/`module_id`/`day_of_week`/`start_time`/`end_time` and skip it (report as "already existed, skipped") rather than creating a duplicate — re-running an import on the same PDF (or a corrected re-upload) shouldn't double every class. Report a final summary: created / skipped / failed, with any failed entries named explicitly so nothing silently vanishes.
+  - **Cancel**: discard the stashed data, confirm cancellation, write nothing.
+- If the extraction comes back with zero schedule entries (parsing failed entirely), say so plainly and suggest manual entry via the existing conversational path — don't show an empty confirm screen.
 
 ## Not in scope for this prompt
 
-- PDF schedule import (rasterize-and-read parsing pipeline, document upload handler, confirmation-before-commit step) — separate prompt, since it's a substantial standalone piece of work that *depends* on `week_pattern` and the anchor already existing here.
-- The 7:30am daily digest job — a future prompt, though it can reuse `build_today_view`'s formatting once it exists; don't wire up any scheduling here.
-- Reactive judgment and companion voice — untouched, as before.
+- Exam schedule / exam-date import (the PDF's `@Exam Schedule` column) — a plausible future extension (likely as one-off `specific_date` schedule blocks or reminders), but a separate prompt.
+- Auto-creating tasks or notes from the registration status (e.g. a task per waitlisted course) — the registered/waitlist counts show up in the confirmation preview only for now; persisting them further is future scope.
+- The topic-tree revamp — this still tags schedule blocks to `module_name` via the current `modules` table, not a `topic_id`. If the revamp lands first, this prompt's module-tagging step needs to be adapted to it; flag that dependency in your plan rather than silently picking one.
+- Daily digest, reactive judgment, companion voice — untouched, as always.

@@ -16,9 +16,12 @@ DB_PATH = Path(__file__).parent / "kangani.db"
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
 # Small fixed palette auto-assigned to new modules that don't specify a color,
-# cycled by how many modules the chat already has.
+# cycled by how many modules the chat already has. These are the 8 --m-* hues
+# from the approved monthly-timetable mockup, so a module's color is identical
+# everywhere it appears (text views, and now the rendered timetable images).
 MODULE_COLOR_PALETTE = [
-    "#EF6F6C", "#5B8DEF", "#5FBB63", "#F2B134", "#9B6FE0", "#3ABAB4",
+    "#B5646B", "#748264", "#5E7A93", "#C79A44",
+    "#8C5B7C", "#4F8074", "#A8763E", "#9B5A5A",
 ]
 
 SCHEMA = """
@@ -906,6 +909,37 @@ def delete_schedule_block(chat_id: int, schedule_block_id: int) -> dict | None:
         )
         conn.commit()
         return dict(row)
+    finally:
+        conn.close()
+
+
+def find_matching_schedule_block(
+    chat_id: int,
+    module_id: int | None,
+    day_of_week: str | None,
+    start_time: str,
+    end_time: str,
+    class_type: str | None,
+) -> dict | None:
+    """Find an existing recurring block with the same slot, used to skip
+    duplicates when re-importing a schedule PDF. Matches on the identity a
+    timetable slot is defined by (module + day + start/end time + class_type).
+
+    class_type is part of the key on purpose: a lecture and a lab can be stacked
+    in the SAME module/day/time slot (differing only by type), and those are
+    genuinely distinct classes that must both survive an import -- keying without
+    class_type would wrongly treat the second as a duplicate of the first.
+    week_pattern is deliberately NOT part of the key, so a corrected re-upload of
+    the same class updates nothing rather than creating a second copy."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM schedule_blocks WHERE chat_id = ? "
+            "AND module_id IS ? AND day_of_week IS ? "
+            "AND start_time = ? AND end_time = ? AND class_type IS ?",
+            (chat_id, module_id, day_of_week, start_time, end_time, class_type),
+        ).fetchone()
+        return dict(row) if row else None
     finally:
         conn.close()
 
