@@ -25,7 +25,8 @@ import timetable_image
 
 
 def _container_label(row: dict) -> str:
-    return row["module_name"] if row["module_name"] is not None else row["event_title"]
+    """A task's attachment label: its topic name, or 'unfiled' if unattached."""
+    return row.get("topic_name") or "unfiled"
 
 
 def build_tasks_view(chat_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
@@ -60,37 +61,14 @@ def build_reminders_view(chat_id: int) -> tuple[str, InlineKeyboardMarkup | None
 
 def build_topics_root_view(chat_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
     topics = database.list_topics(chat_id)
-    if not topics:
+    roots = [t for t in topics if t["parent_topic_id"] is None]
+    if not roots:
         return (
             "You don't have any topics yet. Create one by telling me about "
             "something you want to track.",
             None,
         )
-    modules_seen: dict[int, str] = {}
-    for t in topics:
-        modules_seen.setdefault(t["module_id"], t["module_name"])
-    modules = [{"id": mid, "name": name} for mid, name in modules_seen.items()]
-    return "Choose a module to browse its topics:", keyboards.topic_root_keyboard(
-        modules
-    )
-
-
-def build_topics_module_view(
-    chat_id: int, module_id: int
-) -> tuple[str, InlineKeyboardMarkup | None]:
-    topics = database.list_topics(chat_id)
-    module_topics = [
-        t for t in topics if t["module_id"] == module_id and t["parent_topic_id"] is None
-    ]
-    if not module_topics:
-        return "No top-level topics in this module yet.", keyboards.topic_module_keyboard(
-            []
-        )
-    module_name = module_topics[0]["module_name"]
-    return (
-        f"Topics in {module_name}:",
-        keyboards.topic_module_keyboard(module_topics),
-    )
+    return "Choose a topic to browse:", keyboards.topic_root_keyboard(roots)
 
 
 def build_topics_detail_view(
@@ -102,12 +80,11 @@ def build_topics_detail_view(
     if topic is None:
         return "That topic no longer exists.", None
     subtopics = [t for t in topics if t["parent_topic_id"] == topic_id]
+    # Back to the parent topic, or to the root list for a top-level topic.
     if topic["parent_topic_id"] is not None:
         back_target = f"topic:open:{topic['parent_topic_id']}"
-    elif topic["module_id"] is not None:
-        back_target = f"topic:mod:{topic['module_id']}"
     else:
-        back_target = f"event:open:{topic['event_id']}"
+        back_target = "topic:root"
     return topic["path"], keyboards.topic_detail_keyboard(
         topic_id, subtopics, back_target
     )
@@ -142,44 +119,43 @@ def build_notes_view(chat_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
         tag = "[reference] " if n["is_reference"] else ""
         source_part = f" (source: {n['source']})" if n["source"] else ""
         lines.append(
-            f"#{n['id']} [{_container_label(n)} > {n['topic_name']}] "
-            f"{tag}{n['content']}{source_part}"
+            f"#{n['id']} [{n['topic_name']}] {tag}{n['content']}{source_part}"
         )
     return "\n".join(lines), None
 
 
 def build_events_root_view(chat_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
-    events = database.query_events(chat_id, upcoming_only=True)
+    events = database.list_event_topics(chat_id, upcoming_only=True)
     if not events:
         return "You don't have any upcoming events yet.", None
     return "Choose an event:", keyboards.event_list_keyboard(events)
 
 
 def build_events_detail_view(
-    chat_id: int, event_id: int
+    chat_id: int, topic_id: int
 ) -> tuple[str, InlineKeyboardMarkup | None]:
-    event = database.get_event(chat_id, event_id)
-    if event is None:
+    # "Events" are topics with kind 'event[:type]' and an event_datetime.
+    event = database.get_topic(chat_id, topic_id)
+    if event is None or not (event["kind"] or "").casefold().startswith("event"):
         return "That event no longer exists.", None
 
-    tasks = database.query_tasks(chat_id=chat_id, event_id=event_id)
-    topics = [
+    tasks = database.query_tasks(chat_id=chat_id, topic_id=topic_id)
+    subtopics = [
         t
         for t in database.list_topics(chat_id)
-        if t["event_id"] == event_id and t["parent_topic_id"] is None
+        if t["parent_topic_id"] == topic_id
     ]
 
-    lines = [f"{event['title']} ({event['type']})"]
-    if event["start_date"]:
-        date_part = event["start_date"]
-        if event["end_date"]:
-            date_part += f" to {event['end_date']}"
-        lines.append(date_part)
-    if event["location"]:
-        lines.append(f"Location: {event['location']}")
+    lines = [event["name"]]
+    if event["event_datetime"]:
+        tz = ZoneInfo(os.environ.get("TIMEZONE", "UTC"))
+        local = scheduler.parse_iso_datetime(event["event_datetime"]).astimezone(tz)
+        lines.append(local.strftime("%a %d %b %Y, %H:%M"))
+    if event["status"]:
+        lines.append(f"Status: {event['status']}")
     text = "\n".join(lines)
 
-    return text, keyboards.event_detail_keyboard(event_id, tasks, topics)
+    return text, keyboards.event_detail_keyboard(topic_id, tasks, subtopics)
 
 
 # --- /today and /week -----------------------------------------------------

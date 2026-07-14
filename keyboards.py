@@ -51,14 +51,14 @@ def persistent_reply_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def _origin_suffix(origin_event_id: int | None) -> str:
-    return f":evt:{origin_event_id}" if origin_event_id is not None else ""
+def _origin_suffix(origin_topic_id: int | None) -> str:
+    return f":top:{origin_topic_id}" if origin_topic_id is not None else ""
 
 
 def task_list_keyboard(
-    tasks: list[dict], origin_event_id: int | None = None
+    tasks: list[dict], origin_topic_id: int | None = None
 ) -> InlineKeyboardMarkup:
-    suffix = _origin_suffix(origin_event_id)
+    suffix = _origin_suffix(origin_topic_id)
     rows = []
     for t in tasks:
         rows.append(
@@ -76,9 +76,9 @@ def task_list_keyboard(
 
 
 def task_edit_menu_keyboard(
-    task_id: int, origin_event_id: int | None = None
+    task_id: int, origin_topic_id: int | None = None
 ) -> InlineKeyboardMarkup:
-    suffix = _origin_suffix(origin_event_id)
+    suffix = _origin_suffix(origin_topic_id)
     rows = [
         [
             InlineKeyboardButton(
@@ -122,10 +122,10 @@ def reminder_list_keyboard(reminders: list[dict]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def topic_root_keyboard(modules: list[dict]) -> InlineKeyboardMarkup:
+def topic_root_keyboard(topics: list[dict]) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(m["name"], callback_data=f"topic:mod:{m['id']}")]
-        for m in modules
+        [InlineKeyboardButton(t["name"], callback_data=f"topic:open:{t['id']}")]
+        for t in topics
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -175,18 +175,19 @@ def pdf_import_confirm_keyboard(import_id: str) -> InlineKeyboardMarkup:
 
 
 def event_list_keyboard(events: list[dict]) -> InlineKeyboardMarkup:
+    # "events" are now topics with an event_datetime -- keyed by topic id.
     rows = [
-        [InlineKeyboardButton(e["title"], callback_data=f"event:open:{e['id']}")]
+        [InlineKeyboardButton(e["name"], callback_data=f"event:open:{e['id']}")]
         for e in events
     ]
     return InlineKeyboardMarkup(rows)
 
 
 def event_detail_keyboard(
-    event_id: int, tasks: list[dict], topics: list[dict]
+    topic_id: int, tasks: list[dict], subtopics: list[dict]
 ) -> InlineKeyboardMarkup:
-    rows = list(task_list_keyboard(tasks, origin_event_id=event_id).inline_keyboard)
-    for t in topics:
+    rows = list(task_list_keyboard(tasks, origin_topic_id=topic_id).inline_keyboard)
+    for t in subtopics:
         rows.append(
             [InlineKeyboardButton(t["name"], callback_data=f"topic:open:{t['id']}")]
         )

@@ -8,11 +8,17 @@ migrations when later phases add topics/notes/events functionality.
 
 import re
 import sqlite3
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from datetime import date, timedelta
 
 DB_PATH = Path(__file__).parent / "kangani.db"
+
+
+def _now_utc_iso() -> str:
+    """Canonical UTC 'YYYY-MM-DDTHH:MM:SS.mmmZ' timestamp -- the same format
+    stored in tasks.deadline / reminders.trigger_data / topics.event_datetime,
+    so lexicographic string comparison against those columns is valid."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
@@ -25,58 +31,44 @@ MODULE_COLOR_PALETTE = [
     "#8C5B7C", "#4F8074", "#A8763E", "#9B5A5A",
 ]
 
+# Target schema for a FRESH database. Existing databases are brought to this
+# shape by the data-preserving migration in _migrate_topics_v2 (NOT by a
+# drop-and-recreate) -- `modules` and `events` are collapsed into the unified
+# `topics` tree. Indexes live in _INDEXES (created after any migration, so they
+# never reference a column that only exists post-migration on an existing DB).
 SCHEMA = """
 PRAGMA foreign_keys = ON;
 
-CREATE TABLE IF NOT EXISTS modules (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id     INTEGER NOT NULL,
-    name        TEXT NOT NULL,
-    color       TEXT,
-    created_at  TEXT NOT NULL DEFAULT (STRFTIME('%Y-%m-%dT%H:%M:%fZ','now')),
-    UNIQUE (chat_id, name COLLATE NOCASE)
-);
-
 CREATE TABLE IF NOT EXISTS topics (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    module_id        INTEGER REFERENCES modules(id) ON DELETE CASCADE,
-    event_id         INTEGER REFERENCES events(id) ON DELETE CASCADE,
+    chat_id          INTEGER NOT NULL,
     parent_topic_id  INTEGER REFERENCES topics(id) ON DELETE CASCADE,
     name             TEXT NOT NULL,
+    kind             TEXT,
+    status           TEXT,
+    event_datetime   TEXT,
+    color            TEXT,
     created_at       TEXT NOT NULL DEFAULT (STRFTIME('%Y-%m-%dT%H:%M:%fZ','now')),
-    CHECK ((module_id IS NULL) <> (event_id IS NULL))
+    UNIQUE (chat_id, parent_topic_id, name COLLATE NOCASE)
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id       INTEGER NOT NULL,
-    module_id     INTEGER REFERENCES modules(id) ON DELETE CASCADE,
-    event_id      INTEGER REFERENCES events(id) ON DELETE CASCADE,
+    topic_id      INTEGER REFERENCES topics(id) ON DELETE CASCADE,
     title         TEXT NOT NULL,
     deadline      TEXT,
     status        TEXT NOT NULL DEFAULT 'not_started'
                     CHECK (status IN ('not_started','in_progress','blocked','done')),
     progress_pct  INTEGER NOT NULL DEFAULT 0 CHECK (progress_pct BETWEEN 0 AND 100),
     created_at    TEXT NOT NULL DEFAULT (STRFTIME('%Y-%m-%dT%H:%M:%fZ','now')),
-    updated_at    TEXT NOT NULL DEFAULT (STRFTIME('%Y-%m-%dT%H:%M:%fZ','now')),
-    CHECK ((module_id IS NULL) <> (event_id IS NULL))
-);
-
-CREATE TABLE IF NOT EXISTS events (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id     INTEGER NOT NULL,
-    title       TEXT NOT NULL,
-    type        TEXT CHECK (type IN ('talk','hackathon','other')),
-    start_date  TEXT,
-    end_date    TEXT,
-    location    TEXT,
-    created_at  TEXT NOT NULL DEFAULT (STRFTIME('%Y-%m-%dT%H:%M:%fZ','now'))
+    updated_at    TEXT NOT NULL DEFAULT (STRFTIME('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
 CREATE TABLE IF NOT EXISTS schedule_blocks (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id        INTEGER NOT NULL,
-    module_id      INTEGER REFERENCES modules(id) ON DELETE CASCADE,
+    topic_id       INTEGER REFERENCES topics(id) ON DELETE CASCADE,
     day_of_week    TEXT CHECK (day_of_week IN ('MON','TUE','WED','THU','FRI','SAT','SUN')),
     specific_date  TEXT,
     start_time     TEXT NOT NULL,
@@ -110,36 +102,45 @@ CREATE TABLE IF NOT EXISTS reminders (
     type              TEXT NOT NULL CHECK (type IN ('time','location')),
     trigger_data      TEXT NOT NULL,
     linked_task_id    INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
-    linked_event_id   INTEGER REFERENCES events(id) ON DELETE CASCADE,
+    linked_topic_id   INTEGER REFERENCES topics(id) ON DELETE CASCADE,
     status            TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','fired','cancelled')),
     message           TEXT NOT NULL,
     created_at        TEXT NOT NULL DEFAULT (STRFTIME('%Y-%m-%dT%H:%M:%fZ','now')),
-    CHECK (linked_task_id IS NULL OR linked_event_id IS NULL)
+    CHECK (linked_task_id IS NULL OR linked_topic_id IS NULL)
 );
 
 CREATE TABLE IF NOT EXISTS chat_settings (
     chat_id                   INTEGER PRIMARY KEY,
     semester_week1_start_date TEXT
 );
+"""
 
+# Created after the schema is in its final shape (post-migration), so every
+# indexed column is guaranteed to exist on both fresh and migrated databases.
+_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_tasks_chat_status     ON tasks(chat_id, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_deadline        ON tasks(deadline);
-CREATE INDEX IF NOT EXISTS idx_tasks_event           ON tasks(event_id);
-CREATE INDEX IF NOT EXISTS idx_topics_module         ON topics(module_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_topic           ON tasks(topic_id);
+CREATE INDEX IF NOT EXISTS idx_topics_chat           ON topics(chat_id);
 CREATE INDEX IF NOT EXISTS idx_topics_parent         ON topics(parent_topic_id);
-CREATE INDEX IF NOT EXISTS idx_topics_event          ON topics(event_id);
 CREATE INDEX IF NOT EXISTS idx_notes_topic           ON notes(topic_id);
 CREATE INDEX IF NOT EXISTS idx_progress_logs_topic   ON progress_logs(topic_id);
 CREATE INDEX IF NOT EXISTS idx_schedule_blocks_chat  ON schedule_blocks(chat_id);
-CREATE INDEX IF NOT EXISTS idx_events_chat           ON events(chat_id);
 CREATE INDEX IF NOT EXISTS idx_reminders_chat_status ON reminders(chat_id, status);
 """
 
 _SCHEMA_VERSION = 2
+# Used only by the legacy drop-and-recreate path, which now fires solely for a
+# brand-new/empty DB (version < _SCHEMA_VERSION). 'modules'/'events' stay listed
+# so a stale pre-migration fresh DB still gets them dropped harmlessly.
 _ALL_TABLES = [
     "reminders", "progress_logs", "notes", "schedule_blocks",
     "tasks", "topics", "events", "modules", "chat_settings",
 ]
+
+# Default reminder lead times (minutes before event_datetime) auto-created for a
+# topic that has an event_datetime.
+DEFAULT_EVENT_REMINDER_OFFSETS = [60, 30]
 
 # Valid schedule_block.week_pattern values (besides an explicit week-number list):
 _FIXED_WEEK_PATTERNS = ("every", "odd", "even")
@@ -186,6 +187,216 @@ def get_connection() -> sqlite3.Connection:
     return conn
 
 
+def _migrate_topics_v2(conn: sqlite3.Connection) -> None:
+    """One-time, data-preserving migration collapsing `modules` + `events` into
+    the unified `topics` tree. Idempotent: detected by the presence of the old
+    `modules` table, which this drops on completion, so a second run is a no-op
+    (as is a fresh DB, which never had `modules`).
+
+    Real user data is at stake, so this uses the universally-safe
+    create-new-table / copy-rows / drop-old / rename pattern (no reliance on a
+    given SQLite version's ALTER ... DROP COLUMN support), wrapped in a single
+    transaction with foreign keys off, and validated with foreign_key_check
+    before it commits. Nothing is dropped until every row has been copied and
+    re-pointed.
+    """
+    tables = {r["name"] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    )}
+    if "modules" not in tables:
+        return  # fresh DB, or already migrated
+
+    prev_isolation = conn.isolation_level
+    conn.isolation_level = None  # autocommit -> PRAGMA foreign_keys takes effect
+    try:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("BEGIN")
+
+        for tmp in ("topics_new", "tasks_new", "schedule_blocks_new", "reminders_new"):
+            conn.execute(f"DROP TABLE IF EXISTS {tmp}")
+
+        # New topics table (same columns as SCHEMA's topics, built here so the
+        # migration is self-contained and doesn't depend on statement order).
+        conn.execute("""
+            CREATE TABLE topics_new (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id          INTEGER NOT NULL,
+                parent_topic_id  INTEGER REFERENCES topics_new(id) ON DELETE CASCADE,
+                name             TEXT NOT NULL,
+                kind             TEXT,
+                status           TEXT,
+                event_datetime   TEXT,
+                color            TEXT,
+                created_at       TEXT NOT NULL DEFAULT (STRFTIME('%Y-%m-%dT%H:%M:%fZ','now'))
+            )
+        """)
+
+        # 1. modules -> topics(kind='module'), carrying name + color.
+        mod_map: dict[int, int] = {}
+        mod_chat: dict[int, int] = {}
+        for m in conn.execute("SELECT * FROM modules").fetchall():
+            cur = conn.execute(
+                "INSERT INTO topics_new (chat_id, parent_topic_id, name, kind, color, "
+                "created_at) VALUES (?, NULL, ?, 'module', ?, ?)",
+                (m["chat_id"], m["name"], m["color"], m["created_at"]),
+            )
+            mod_map[m["id"]] = cur.lastrowid
+            mod_chat[m["id"]] = m["chat_id"]
+
+        # 2. events -> topics(kind='event[:type]'), title->name, start_date->
+        #    event_datetime. The old talk/hackathon/other type is folded into the
+        #    free-string kind (e.g. 'event:hackathon'); end_date/location have no
+        #    topic column and are dropped (flagged: 0 event rows in the live DB).
+        evt_map: dict[int, int] = {}
+        evt_chat: dict[int, int] = {}
+        if "events" in tables:
+            for e in conn.execute("SELECT * FROM events").fetchall():
+                kind = f"event:{e['type']}" if e["type"] else "event"
+                cur = conn.execute(
+                    "INSERT INTO topics_new (chat_id, parent_topic_id, name, kind, "
+                    "event_datetime, created_at) VALUES (?, NULL, ?, ?, ?, ?)",
+                    (e["chat_id"], e["title"], kind, e["start_date"], e["created_at"]),
+                )
+                evt_map[e["id"]] = cur.lastrowid
+                evt_chat[e["id"]] = e["chat_id"]
+
+        # 3. old topics -> topics_new. Old topics rooted at a module/event become
+        #    children of the corresponding new module/event topic; nested topics
+        #    keep their parent. Two passes so parents (which may sort after
+        #    children) are always resolvable via the id map.
+        old_topics = conn.execute("SELECT * FROM topics").fetchall()
+        topic_map: dict[int, int] = {}
+        for t in old_topics:
+            chat = (mod_chat.get(t["module_id"]) if t["module_id"] is not None
+                    else evt_chat.get(t["event_id"]))
+            cur = conn.execute(
+                "INSERT INTO topics_new (chat_id, parent_topic_id, name, created_at) "
+                "VALUES (?, NULL, ?, ?)",
+                (chat, t["name"], t["created_at"]),
+            )
+            topic_map[t["id"]] = cur.lastrowid
+        for t in old_topics:
+            if t["parent_topic_id"] is not None:
+                parent = topic_map.get(t["parent_topic_id"])
+            elif t["module_id"] is not None:
+                parent = mod_map.get(t["module_id"])
+            else:
+                parent = evt_map.get(t["event_id"])
+            conn.execute(
+                "UPDATE topics_new SET parent_topic_id = ? WHERE id = ?",
+                (parent, topic_map[t["id"]]),
+            )
+
+        # Notes / progress_logs reference topic ids, which just changed -> remap.
+        for old_id, new_id in topic_map.items():
+            conn.execute("UPDATE notes SET topic_id = ? WHERE topic_id = ?", (new_id, old_id))
+            conn.execute("UPDATE progress_logs SET topic_id = ? WHERE topic_id = ?", (new_id, old_id))
+
+        def _topic_for(module_id, event_id):
+            if module_id is not None:
+                return mod_map.get(module_id)
+            if event_id is not None:
+                return evt_map.get(event_id)
+            return None
+
+        # 4. tasks: module_id/event_id -> single topic_id.
+        conn.execute("""
+            CREATE TABLE tasks_new (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id       INTEGER NOT NULL,
+                topic_id      INTEGER REFERENCES topics_new(id) ON DELETE CASCADE,
+                title         TEXT NOT NULL,
+                deadline      TEXT,
+                status        TEXT NOT NULL DEFAULT 'not_started'
+                                CHECK (status IN ('not_started','in_progress','blocked','done')),
+                progress_pct  INTEGER NOT NULL DEFAULT 0 CHECK (progress_pct BETWEEN 0 AND 100),
+                created_at    TEXT NOT NULL DEFAULT (STRFTIME('%Y-%m-%dT%H:%M:%fZ','now')),
+                updated_at    TEXT NOT NULL DEFAULT (STRFTIME('%Y-%m-%dT%H:%M:%fZ','now'))
+            )
+        """)
+        for t in conn.execute("SELECT * FROM tasks").fetchall():
+            conn.execute(
+                "INSERT INTO tasks_new (id, chat_id, topic_id, title, deadline, status, "
+                "progress_pct, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (t["id"], t["chat_id"], _topic_for(t["module_id"], t["event_id"]),
+                 t["title"], t["deadline"], t["status"], t["progress_pct"],
+                 t["created_at"], t["updated_at"]),
+            )
+
+        # 5. schedule_blocks: module_id -> topic_id (keeps class_type/week_pattern).
+        conn.execute("""
+            CREATE TABLE schedule_blocks_new (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id        INTEGER NOT NULL,
+                topic_id       INTEGER REFERENCES topics_new(id) ON DELETE CASCADE,
+                day_of_week    TEXT CHECK (day_of_week IN ('MON','TUE','WED','THU','FRI','SAT','SUN')),
+                specific_date  TEXT,
+                start_time     TEXT NOT NULL,
+                end_time       TEXT NOT NULL,
+                class_type     TEXT,
+                location       TEXT,
+                week_pattern   TEXT NOT NULL DEFAULT 'every',
+                created_at     TEXT NOT NULL DEFAULT (STRFTIME('%Y-%m-%dT%H:%M:%fZ','now')),
+                CHECK ((day_of_week IS NULL) <> (specific_date IS NULL))
+            )
+        """)
+        for s in conn.execute("SELECT * FROM schedule_blocks").fetchall():
+            conn.execute(
+                "INSERT INTO schedule_blocks_new (id, chat_id, topic_id, day_of_week, "
+                "specific_date, start_time, end_time, class_type, location, week_pattern, "
+                "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (s["id"], s["chat_id"], _topic_for(s["module_id"], None), s["day_of_week"],
+                 s["specific_date"], s["start_time"], s["end_time"], s["class_type"],
+                 s["location"], s["week_pattern"], s["created_at"]),
+            )
+
+        # 6. reminders: linked_event_id -> linked_topic_id.
+        conn.execute("""
+            CREATE TABLE reminders_new (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id           INTEGER NOT NULL,
+                type              TEXT NOT NULL CHECK (type IN ('time','location')),
+                trigger_data      TEXT NOT NULL,
+                linked_task_id    INTEGER REFERENCES tasks_new(id) ON DELETE CASCADE,
+                linked_topic_id   INTEGER REFERENCES topics_new(id) ON DELETE CASCADE,
+                status            TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','fired','cancelled')),
+                message           TEXT NOT NULL,
+                created_at        TEXT NOT NULL DEFAULT (STRFTIME('%Y-%m-%dT%H:%M:%fZ','now')),
+                CHECK (linked_task_id IS NULL OR linked_topic_id IS NULL)
+            )
+        """)
+        for r in conn.execute("SELECT * FROM reminders").fetchall():
+            conn.execute(
+                "INSERT INTO reminders_new (id, chat_id, type, trigger_data, linked_task_id, "
+                "linked_topic_id, status, message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (r["id"], r["chat_id"], r["type"], r["trigger_data"], r["linked_task_id"],
+                 evt_map.get(r["linked_event_id"]), r["status"], r["message"], r["created_at"]),
+            )
+
+        # 7. Only now, everything copied and re-pointed: drop old, rename new.
+        conn.execute("DROP TABLE reminders")
+        conn.execute("DROP TABLE schedule_blocks")
+        conn.execute("DROP TABLE tasks")
+        conn.execute("DROP TABLE topics")
+        conn.execute("DROP TABLE IF EXISTS events")
+        conn.execute("DROP TABLE modules")
+        conn.execute("ALTER TABLE topics_new RENAME TO topics")
+        conn.execute("ALTER TABLE tasks_new RENAME TO tasks")
+        conn.execute("ALTER TABLE schedule_blocks_new RENAME TO schedule_blocks")
+        conn.execute("ALTER TABLE reminders_new RENAME TO reminders")
+
+        broken = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if broken:
+            raise RuntimeError(f"topic migration left dangling references: {broken}")
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.isolation_level = prev_isolation
+
+
 def init_db() -> None:
     """Create the schema, or reset it if it's behind _SCHEMA_VERSION.
 
@@ -220,167 +431,63 @@ def init_db() -> None:
         # e.g. "7" or "7,14"; NULL/empty means none. Nullable, added additively
         # so it never disturbs an existing (possibly live) chat_settings row.
         _ensure_column(conn, "chat_settings", "recess_weeks", "TEXT")
+        conn.commit()
+        # One-time, data-preserving collapse of modules/events into the topics
+        # tree. Runs in place on an existing DB; a no-op once done or on a fresh
+        # DB. Deliberately NOT gated behind a _SCHEMA_VERSION bump, because that
+        # would trigger the destructive drop-all above on the live DB.
+        _migrate_topics_v2(conn)
+        conn.executescript(_INDEXES)
         conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
         conn.commit()
     finally:
         conn.close()
 
 
-# --- modules ---------------------------------------------------------------
-
-def get_or_create_module(chat_id: int, name: str, color: str | None = None) -> dict:
-    conn = get_connection()
-    try:
-        row = conn.execute(
-            "SELECT * FROM modules WHERE chat_id = ? AND name = ? COLLATE NOCASE",
-            (chat_id, name),
-        ).fetchone()
-        if row:
-            return dict(row)
-
-        if color is None:
-            existing_count = conn.execute(
-                "SELECT COUNT(*) FROM modules WHERE chat_id = ?", (chat_id,)
-            ).fetchone()[0]
-            color = MODULE_COLOR_PALETTE[existing_count % len(MODULE_COLOR_PALETTE)]
-
-        try:
-            cur = conn.execute(
-                "INSERT INTO modules (chat_id, name, color) VALUES (?, ?, ?)",
-                (chat_id, name, color),
-            )
-            conn.commit()
-        except sqlite3.IntegrityError:
-            # Lost a create-vs-create race against another connection --
-            # the module now exists, so fetch and return it instead of erroring.
-            row = conn.execute(
-                "SELECT * FROM modules WHERE chat_id = ? AND name = ? COLLATE NOCASE",
-                (chat_id, name),
-            ).fetchone()
-            return dict(row)
-        row = conn.execute(
-            "SELECT * FROM modules WHERE id = ?", (cur.lastrowid,)
-        ).fetchone()
-        return dict(row)
-    finally:
-        conn.close()
-
-
-def list_modules(chat_id: int) -> list[dict]:
-    conn = get_connection()
-    try:
-        rows = conn.execute(
-            "SELECT * FROM modules WHERE chat_id = ? ORDER BY name COLLATE NOCASE",
-            (chat_id,),
-        ).fetchall()
-        return [dict(r) for r in rows]
-    finally:
-        conn.close()
-
-
-# --- events --------------------------------------------------------------
-
-_EVENT_TYPES = ("talk", "hackathon", "other")
-
-
-def create_event(
-    chat_id: int,
-    title: str,
-    type: str,
-    start_date: str | None = None,
-    end_date: str | None = None,
-    location: str | None = None,
-) -> dict:
-    if type not in _EVENT_TYPES:
-        raise ValueError(f"type must be one of {_EVENT_TYPES}, got {type!r}")
-    conn = get_connection()
-    try:
-        cur = conn.execute(
-            "INSERT INTO events (chat_id, title, type, start_date, end_date, location) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (chat_id, title, type, start_date, end_date, location),
-        )
-        conn.commit()
-        row = conn.execute(
-            "SELECT * FROM events WHERE id = ?", (cur.lastrowid,)
-        ).fetchone()
-        return dict(row)
-    finally:
-        conn.close()
-
-
-def query_events(
-    chat_id: int, type: str | None = None, upcoming_only: bool = True
-) -> list[dict]:
-    conn = get_connection()
-    try:
-        clauses = ["chat_id = ?"]
-        params: list = [chat_id]
-        if type is not None:
-            clauses.append("type = ?")
-            params.append(type)
-        if upcoming_only:
-            clauses.append(
-                "(COALESCE(end_date, start_date) IS NULL "
-                "OR COALESCE(end_date, start_date) >= DATE('now'))"
-            )
-        sql = (
-            "SELECT * FROM events "
-            f"WHERE {' AND '.join(clauses)} "
-            "ORDER BY start_date IS NULL, start_date ASC"
-        )
-        rows = conn.execute(sql, params).fetchall()
-        return [dict(r) for r in rows]
-    finally:
-        conn.close()
-
-
-def get_event(chat_id: int, event_id: int) -> dict | None:
-    conn = get_connection()
-    try:
-        row = conn.execute(
-            "SELECT * FROM events WHERE id = ? AND chat_id = ?", (event_id, chat_id)
-        ).fetchone()
-        return dict(row) if row else None
-    finally:
-        conn.close()
+# --- modules & events are gone --------------------------------------------
+# A "module" is now a topic with kind='module' (auto-coloured); an "event" is a
+# topic with kind='event[:type]' and an event_datetime. Both are created through
+# get_or_create_topic / create_topic in the topics section below.
 
 
 # --- tasks -------------------------------------------------------------
 
+# Tasks now attach to a single optional topic_id (or nowhere). This SELECT
+# carries the attached topic's name/kind for display labels.
+_TASK_SELECT = (
+    "SELECT tasks.*, topics.name AS topic_name, topics.kind AS topic_kind "
+    "FROM tasks LEFT JOIN topics ON topics.id = tasks.topic_id "
+)
+
+
+def _require_topic(conn: sqlite3.Connection, chat_id: int, topic_id: int) -> None:
+    """Raise ValueError unless topic_id exists and belongs to chat_id."""
+    row = conn.execute(
+        "SELECT 1 FROM topics WHERE id = ? AND chat_id = ?", (topic_id, chat_id)
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"No topic with id {topic_id} found for this chat.")
+
+
 def create_task(
     chat_id: int,
     title: str,
-    module_name: str | None = None,
-    event_id: int | None = None,
+    topic_id: int | None = None,
     deadline: str | None = None,
     status: str = "not_started",
 ) -> dict:
-    if (module_name is None) == (event_id is None):
-        raise ValueError("Exactly one of module_name or event_id must be given.")
-
-    if event_id is not None:
-        if get_event(chat_id, event_id) is None:
-            raise ValueError(f"No event with id {event_id} found for this chat.")
-        module_id = None
-    else:
-        module_id = get_or_create_module(chat_id, module_name)["id"]
-
     conn = get_connection()
     try:
+        if topic_id is not None:
+            _require_topic(conn, chat_id, topic_id)
         cur = conn.execute(
-            "INSERT INTO tasks (chat_id, module_id, event_id, title, deadline, status) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (chat_id, module_id, event_id, title, deadline, status),
+            "INSERT INTO tasks (chat_id, topic_id, title, deadline, status) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (chat_id, topic_id, title, deadline, status),
         )
         conn.commit()
         row = conn.execute(
-            "SELECT tasks.*, modules.name AS module_name, events.title AS event_title "
-            "FROM tasks "
-            "LEFT JOIN modules ON modules.id = tasks.module_id "
-            "LEFT JOIN events ON events.id = tasks.event_id "
-            "WHERE tasks.id = ?",
-            (cur.lastrowid,),
+            _TASK_SELECT + "WHERE tasks.id = ?", (cur.lastrowid,)
         ).fetchone()
         return dict(row)
     finally:
@@ -410,12 +517,7 @@ def update_task_status(
         if cur.rowcount == 0:
             return None
         row = conn.execute(
-            "SELECT tasks.*, modules.name AS module_name, events.title AS event_title "
-            "FROM tasks "
-            "LEFT JOIN modules ON modules.id = tasks.module_id "
-            "LEFT JOIN events ON events.id = tasks.event_id "
-            "WHERE tasks.id = ?",
-            (task_id,),
+            _TASK_SELECT + "WHERE tasks.id = ?", (task_id,)
         ).fetchone()
         return dict(row)
     finally:
@@ -426,11 +528,7 @@ def get_task(chat_id: int, task_id: int) -> dict | None:
     conn = get_connection()
     try:
         row = conn.execute(
-            "SELECT tasks.*, modules.name AS module_name, events.title AS event_title "
-            "FROM tasks "
-            "LEFT JOIN modules ON modules.id = tasks.module_id "
-            "LEFT JOIN events ON events.id = tasks.event_id "
-            "WHERE tasks.id = ? AND tasks.chat_id = ?",
+            _TASK_SELECT + "WHERE tasks.id = ? AND tasks.chat_id = ?",
             (task_id, chat_id),
         ).fetchone()
         return dict(row) if row else None
@@ -441,8 +539,7 @@ def get_task(chat_id: int, task_id: int) -> dict | None:
 def query_tasks(
     chat_id: int,
     status: str | None = None,
-    module_name: str | None = None,
-    event_id: int | None = None,
+    topic_id: int | None = None,
     deadline_from: str | None = None,
     deadline_to: str | None = None,
     limit: int = 20,
@@ -455,12 +552,9 @@ def query_tasks(
         if status is not None:
             clauses.append("tasks.status = ?")
             params.append(status)
-        if module_name is not None:
-            clauses.append("modules.name = ? COLLATE NOCASE")
-            params.append(module_name)
-        if event_id is not None:
-            clauses.append("tasks.event_id = ?")
-            params.append(event_id)
+        if topic_id is not None:
+            clauses.append("tasks.topic_id = ?")
+            params.append(topic_id)
         if deadline_from is not None:
             clauses.append("tasks.deadline >= ?")
             params.append(deadline_from)
@@ -470,11 +564,8 @@ def query_tasks(
 
         params.append(limit)
         sql = (
-            "SELECT tasks.*, modules.name AS module_name, events.title AS event_title "
-            "FROM tasks "
-            "LEFT JOIN modules ON modules.id = tasks.module_id "
-            "LEFT JOIN events ON events.id = tasks.event_id "
-            f"WHERE {' AND '.join(clauses)} "
+            _TASK_SELECT
+            + f"WHERE {' AND '.join(clauses)} "
             "ORDER BY tasks.deadline IS NULL, tasks.deadline ASC LIMIT ?"
         )
         rows = conn.execute(sql, params).fetchall()
@@ -490,8 +581,10 @@ def create_reminder(
     trigger_datetime_utc: str,
     message: str,
     linked_task_id: int | None = None,
-    linked_event_id: int | None = None,
+    linked_topic_id: int | None = None,
 ) -> dict:
+    if linked_task_id is not None and linked_topic_id is not None:
+        raise ValueError("A reminder can link to a task or a topic, not both.")
     conn = get_connection()
     try:
         if linked_task_id is not None:
@@ -503,11 +596,13 @@ def create_reminder(
                 raise ValueError(
                     f"No task with id {linked_task_id} found for this chat."
                 )
+        if linked_topic_id is not None:
+            _require_topic(conn, chat_id, linked_topic_id)
 
         cur = conn.execute(
             "INSERT INTO reminders (chat_id, type, trigger_data, message, "
-            "linked_task_id, linked_event_id) VALUES (?, 'time', ?, ?, ?, ?)",
-            (chat_id, trigger_datetime_utc, message, linked_task_id, linked_event_id),
+            "linked_task_id, linked_topic_id) VALUES (?, 'time', ?, ?, ?, ?)",
+            (chat_id, trigger_datetime_utc, message, linked_task_id, linked_topic_id),
         )
         conn.commit()
         row = conn.execute(
@@ -589,87 +684,64 @@ def list_pending_reminders(chat_id: int) -> list[dict]:
 
 # --- topics --------------------------------------------------------------
 
+# Canonical topic kinds, surfaced first by list_topic_kinds so Claude reuses an
+# existing kind rather than minting a near-duplicate. `kind` is otherwise a free
+# string (no CHECK), so new kinds never need a schema change.
+CANONICAL_TOPIC_KINDS = ["course", "year", "semester", "module", "component", "event"]
+
+
 def get_or_create_topic(
     chat_id: int,
     name: str,
-    module_name: str | None = None,
-    event_id: int | None = None,
+    kind: str | None = None,
+    status: str | None = None,
+    event_datetime: str | None = None,
+    color: str | None = None,
     parent_topic_id: int | None = None,
 ) -> dict:
+    """Fetch or create a topic anywhere in the tree.
+
+    A topic attaches under parent_topic_id, or at the root (parent_topic_id
+    None). Dedup is by (chat_id, parent, name) case-insensitively. A kind
+    'module' topic with no explicit color is auto-assigned the next
+    MODULE_COLOR_PALETTE hue (so timetable colors keep working); other kinds
+    are left uncolored.
+    """
     conn = get_connection()
     try:
         if parent_topic_id is not None:
-            parent = conn.execute(
-                "SELECT topics.*, "
-                "COALESCE(modules.chat_id, events.chat_id) AS chat_id, "
-                "modules.name AS module_name, events.title AS event_title "
-                "FROM topics "
-                "LEFT JOIN modules ON modules.id = topics.module_id "
-                "LEFT JOIN events ON events.id = topics.event_id "
-                "WHERE topics.id = ?",
-                (parent_topic_id,),
-            ).fetchone()
-            if parent is None or parent["chat_id"] != chat_id:
-                raise ValueError(
-                    f"No topic with id {parent_topic_id} found for this chat."
-                )
-            # Subtopics inherit whichever container (module or event) their
-            # parent has -- a straight copy, since the parent's own CHECK
-            # constraint already guarantees exactly one of the two is set.
-            # Distinct local names (not reusing the `event_id` parameter) are
-            # deliberate: reassigning the parameter would make the mismatch
-            # check below compare a value against itself and never fire.
-            container_module_id = parent["module_id"]
-            container_event_id = parent["event_id"]
-
-            if module_name is not None and (
-                parent["module_name"] is None
-                or module_name.strip().casefold() != parent["module_name"].casefold()
-            ):
-                raise ValueError(
-                    f"Parent topic #{parent_topic_id} does not belong to module "
-                    f"'{module_name}'. Subtopics inherit their parent's container "
-                    "automatically -- omit module_name/event_id or pass the "
-                    "matching one."
-                )
-            if event_id is not None and event_id != container_event_id:
-                raise ValueError(
-                    f"Parent topic #{parent_topic_id} does not belong to event "
-                    f"#{event_id}. Subtopics inherit their parent's container "
-                    "automatically -- omit module_name/event_id or pass the "
-                    "matching one."
-                )
-        else:
-            if (module_name is None) == (event_id is None):
-                raise ValueError(
-                    "Exactly one of module_name or event_id must be given "
-                    "when creating a top-level topic (no parent_topic_id)."
-                )
-            if event_id is not None:
-                if get_event(chat_id, event_id) is None:
-                    raise ValueError(
-                        f"No event with id {event_id} found for this chat."
-                    )
-                container_module_id = None
-                container_event_id = event_id
-            else:
-                container_module_id = get_or_create_module(chat_id, module_name)["id"]
-                container_event_id = None
+            _require_topic(conn, chat_id, parent_topic_id)
 
         row = conn.execute(
-            "SELECT * FROM topics WHERE module_id IS ? AND event_id IS ? "
-            "AND name = ? COLLATE NOCASE AND parent_topic_id IS ?",
-            (container_module_id, container_event_id, name, parent_topic_id),
+            "SELECT * FROM topics WHERE chat_id = ? AND parent_topic_id IS ? "
+            "AND name = ? COLLATE NOCASE",
+            (chat_id, parent_topic_id, name),
         ).fetchone()
         if row:
             return dict(row)
 
-        cur = conn.execute(
-            "INSERT INTO topics (module_id, event_id, parent_topic_id, name) "
-            "VALUES (?, ?, ?, ?)",
-            (container_module_id, container_event_id, parent_topic_id, name),
-        )
-        conn.commit()
+        if kind == "module" and color is None:
+            existing = conn.execute(
+                "SELECT COUNT(*) FROM topics WHERE chat_id = ? AND kind = 'module'",
+                (chat_id,),
+            ).fetchone()[0]
+            color = MODULE_COLOR_PALETTE[existing % len(MODULE_COLOR_PALETTE)]
+
+        try:
+            cur = conn.execute(
+                "INSERT INTO topics (chat_id, parent_topic_id, name, kind, status, "
+                "event_datetime, color) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (chat_id, parent_topic_id, name, kind, status, event_datetime, color),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            # Lost a create-vs-create race -- fetch the winner and return it.
+            row = conn.execute(
+                "SELECT * FROM topics WHERE chat_id = ? AND parent_topic_id IS ? "
+                "AND name = ? COLLATE NOCASE",
+                (chat_id, parent_topic_id, name),
+            ).fetchone()
+            return dict(row)
         row = conn.execute(
             "SELECT * FROM topics WHERE id = ?", (cur.lastrowid,)
         ).fetchone()
@@ -678,37 +750,37 @@ def get_or_create_topic(
         conn.close()
 
 
-def list_topics(chat_id: int, module_name: str | None = None) -> list[dict]:
+def get_topic(chat_id: int, topic_id: int) -> dict | None:
     conn = get_connection()
     try:
-        # (modules.chat_id = ? OR events.chat_id = ?), not just modules.chat_id
-        # -- with a LEFT JOIN, an event-rooted topic has modules.chat_id NULL,
-        # so plain "modules.chat_id = ?" would silently hide it from its own
-        # owner.
-        clauses = ["(modules.chat_id = ? OR events.chat_id = ?)"]
-        params: list = [chat_id, chat_id]
-        if module_name is not None:
-            clauses.append("modules.name = ? COLLATE NOCASE")
-            params.append(module_name)
-        sql = (
-            "SELECT topics.*, modules.name AS module_name, events.title AS event_title "
-            "FROM topics "
-            "LEFT JOIN modules ON modules.id = topics.module_id "
-            "LEFT JOIN events ON events.id = topics.event_id "
-            f"WHERE {' AND '.join(clauses)} "
-            "ORDER BY COALESCE(modules.name, events.title) COLLATE NOCASE, "
-            "topics.name COLLATE NOCASE"
-        )
-        rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+        row = conn.execute(
+            "SELECT * FROM topics WHERE id = ? AND chat_id = ?", (topic_id, chat_id)
+        ).fetchone()
+        return dict(row) if row else None
     finally:
         conn.close()
 
-    by_id = {r["id"]: r for r in rows}
+
+def list_topics(chat_id: int, kind: str | None = None) -> list[dict]:
+    """All of a chat's topics (each with a computed root->leaf `path`), or only
+    those of a given kind. The path is always resolved against the full tree, so
+    a kind-filtered result still shows correct ancestor names."""
+    conn = get_connection()
+    try:
+        all_rows = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT * FROM topics WHERE chat_id = ? ORDER BY name COLLATE NOCASE",
+                (chat_id,),
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+
+    by_id = {r["id"]: r for r in all_rows}
 
     def build_path(topic: dict) -> str:
-        # Defensive cycle guard: structurally impossible given this phase's
-        # tools (a topic's parent_topic_id is fixed at insert time and there
-        # is no reparent tool), but cheap insurance against a manual DB edit.
+        # Defensive cycle guard against a manual DB edit introducing a loop.
         names: list[str] = []
         cur = topic
         seen: set[int] = set()
@@ -718,16 +790,49 @@ def list_topics(chat_id: int, module_name: str | None = None) -> list[dict]:
             pid = cur["parent_topic_id"]
             cur = by_id.get(pid) if pid is not None else None
         names.reverse()
-        root_label = (
-            topic["module_name"]
-            if topic["module_name"] is not None
-            else topic["event_title"]
-        )
-        return " > ".join([root_label] + names)
+        return " > ".join(names)
 
-    for r in rows:
+    for r in all_rows:
         r["path"] = build_path(r)
-    return rows
+
+    if kind is not None:
+        return [r for r in all_rows if (r["kind"] or "").casefold() == kind.casefold()]
+    return all_rows
+
+
+def list_topic_kinds(chat_id: int) -> list[str]:
+    """Distinct topic kinds already in use for this chat, canonical ones first."""
+    conn = get_connection()
+    try:
+        in_use = {
+            r["kind"]
+            for r in conn.execute(
+                "SELECT DISTINCT kind FROM topics "
+                "WHERE chat_id = ? AND kind IS NOT NULL AND kind <> ''",
+                (chat_id,),
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+    ordered = [k for k in CANONICAL_TOPIC_KINDS if k in in_use]
+    extras = sorted(k for k in in_use if k not in CANONICAL_TOPIC_KINDS)
+    return ordered + extras
+
+
+def list_event_topics(chat_id: int, upcoming_only: bool = True) -> list[dict]:
+    """Topics that represent events (kind 'event' or 'event:<type>') with an
+    event_datetime, ordered soonest-first; future-only by default."""
+    events = [
+        t
+        for t in list_topics(chat_id)
+        if (t["kind"] or "").casefold().startswith("event")
+        and t["event_datetime"]
+    ]
+    if upcoming_only:
+        now_iso = _now_utc_iso()
+        events = [t for t in events if t["event_datetime"] >= now_iso]
+    events.sort(key=lambda t: t["event_datetime"])
+    return events
 
 
 # --- notes -----------------------------------------------------------------
@@ -741,21 +846,7 @@ def create_note(
 ) -> dict:
     conn = get_connection()
     try:
-        # LEFT JOIN both containers + COALESCE -- an INNER JOIN through
-        # modules only would return zero rows (and a false "no such topic")
-        # for any topic rooted under an event, since its module_id is NULL.
-        topic = conn.execute(
-            "SELECT topics.id, "
-            "COALESCE(modules.chat_id, events.chat_id) AS chat_id "
-            "FROM topics "
-            "LEFT JOIN modules ON modules.id = topics.module_id "
-            "LEFT JOIN events ON events.id = topics.event_id "
-            "WHERE topics.id = ?",
-            (topic_id,),
-        ).fetchone()
-        if topic is None or topic["chat_id"] != chat_id:
-            raise ValueError(f"No topic with id {topic_id} found for this chat.")
-
+        _require_topic(conn, chat_id, topic_id)
         cur = conn.execute(
             "INSERT INTO notes (topic_id, source, content, is_reference) "
             "VALUES (?, ?, ?, ?)",
@@ -763,11 +854,8 @@ def create_note(
         )
         conn.commit()
         row = conn.execute(
-            "SELECT notes.*, topics.name AS topic_name, "
-            "modules.name AS module_name, events.title AS event_title "
+            "SELECT notes.*, topics.name AS topic_name "
             "FROM notes JOIN topics ON topics.id = notes.topic_id "
-            "LEFT JOIN modules ON modules.id = topics.module_id "
-            "LEFT JOIN events ON events.id = topics.event_id "
             "WHERE notes.id = ?",
             (cur.lastrowid,),
         ).fetchone()
@@ -779,32 +867,25 @@ def create_note(
 def query_notes(
     chat_id: int,
     topic_id: int | None = None,
-    module_name: str | None = None,
     is_reference: bool | None = None,
     limit: int = 20,
 ) -> list[dict]:
     conn = get_connection()
     try:
-        clauses = ["(modules.chat_id = ? OR events.chat_id = ?)"]
-        params: list = [chat_id, chat_id]
+        clauses = ["topics.chat_id = ?"]
+        params: list = [chat_id]
         if topic_id is not None:
             clauses.append("notes.topic_id = ?")
             params.append(topic_id)
-        if module_name is not None:
-            clauses.append("modules.name = ? COLLATE NOCASE")
-            params.append(module_name)
         if is_reference is not None:
             clauses.append("notes.is_reference = ?")
             params.append(1 if is_reference else 0)
 
         params.append(limit)
         sql = (
-            "SELECT notes.*, topics.name AS topic_name, "
-            "modules.name AS module_name, events.title AS event_title "
+            "SELECT notes.*, topics.name AS topic_name "
             "FROM notes "
             "JOIN topics ON topics.id = notes.topic_id "
-            "LEFT JOIN modules ON modules.id = topics.module_id "
-            "LEFT JOIN events ON events.id = topics.event_id "
             f"WHERE {' AND '.join(clauses)} "
             "ORDER BY notes.created_at DESC LIMIT ?"
         )
@@ -845,20 +926,27 @@ def create_schedule_block(
             ) from None
     week_pattern = _validate_week_pattern(week_pattern)
 
-    module_id = get_or_create_module(chat_id, module_name)["id"] if module_name else None
+    # `module_name` is kept as a convenience for callers (the NL tool schema,
+    # the PDF import path): a class's module is just a topic with kind='module',
+    # resolved/created here so those callers never deal in topic_ids.
+    topic_id = (
+        get_or_create_topic(chat_id, module_name, kind="module")["id"]
+        if module_name
+        else None
+    )
     conn = get_connection()
     try:
         cur = conn.execute(
-            "INSERT INTO schedule_blocks (chat_id, module_id, day_of_week, "
+            "INSERT INTO schedule_blocks (chat_id, topic_id, day_of_week, "
             "specific_date, start_time, end_time, class_type, location, week_pattern) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (chat_id, module_id, day_of_week, specific_date, start_time,
+            (chat_id, topic_id, day_of_week, specific_date, start_time,
              end_time, class_type, location, week_pattern),
         )
         conn.commit()
         row = conn.execute(
-            "SELECT schedule_blocks.*, modules.name AS module_name FROM schedule_blocks "
-            "LEFT JOIN modules ON modules.id = schedule_blocks.module_id "
+            "SELECT schedule_blocks.*, topics.name AS module_name FROM schedule_blocks "
+            "LEFT JOIN topics ON topics.id = schedule_blocks.topic_id "
             "WHERE schedule_blocks.id = ?",
             (cur.lastrowid,),
         ).fetchone()
@@ -876,13 +964,13 @@ def list_schedule_blocks(
     conn = get_connection()
     try:
         sql = (
-            "SELECT schedule_blocks.*, modules.name AS module_name FROM schedule_blocks "
-            "LEFT JOIN modules ON modules.id = schedule_blocks.module_id "
+            "SELECT schedule_blocks.*, topics.name AS module_name FROM schedule_blocks "
+            "LEFT JOIN topics ON topics.id = schedule_blocks.topic_id "
             "WHERE schedule_blocks.chat_id = ? "
             "AND (schedule_blocks.day_of_week IS NOT NULL "
             "     OR ((? IS NULL OR schedule_blocks.specific_date >= ?) "
             "         AND (? IS NULL OR schedule_blocks.specific_date <= ?))) "
-            "AND (? IS NULL OR modules.name = ? COLLATE NOCASE) "
+            "AND (? IS NULL OR topics.name = ? COLLATE NOCASE) "
             "ORDER BY schedule_blocks.specific_date IS NULL, schedule_blocks.specific_date, "
             "schedule_blocks.day_of_week, schedule_blocks.start_time"
         )
@@ -902,8 +990,8 @@ def delete_schedule_block(chat_id: int, schedule_block_id: int) -> dict | None:
     conn = get_connection()
     try:
         row = conn.execute(
-            "SELECT schedule_blocks.*, modules.name AS module_name FROM schedule_blocks "
-            "LEFT JOIN modules ON modules.id = schedule_blocks.module_id "
+            "SELECT schedule_blocks.*, topics.name AS module_name FROM schedule_blocks "
+            "LEFT JOIN topics ON topics.id = schedule_blocks.topic_id "
             "WHERE schedule_blocks.id = ? AND schedule_blocks.chat_id = ?",
             (schedule_block_id, chat_id),
         ).fetchone()
@@ -920,7 +1008,7 @@ def delete_schedule_block(chat_id: int, schedule_block_id: int) -> dict | None:
 
 def find_matching_schedule_block(
     chat_id: int,
-    module_id: int | None,
+    topic_id: int | None,
     day_of_week: str | None,
     start_time: str,
     end_time: str,
@@ -928,7 +1016,7 @@ def find_matching_schedule_block(
 ) -> dict | None:
     """Find an existing recurring block with the same slot, used to skip
     duplicates when re-importing a schedule PDF. Matches on the identity a
-    timetable slot is defined by (module + day + start/end time + class_type).
+    timetable slot is defined by (module topic + day + start/end time + class_type).
 
     class_type is part of the key on purpose: a lecture and a lab can be stacked
     in the SAME module/day/time slot (differing only by type), and those are
@@ -940,9 +1028,9 @@ def find_matching_schedule_block(
     try:
         row = conn.execute(
             "SELECT * FROM schedule_blocks WHERE chat_id = ? "
-            "AND module_id IS ? AND day_of_week IS ? "
+            "AND topic_id IS ? AND day_of_week IS ? "
             "AND start_time = ? AND end_time = ? AND class_type IS ?",
-            (chat_id, module_id, day_of_week, start_time, end_time, class_type),
+            (chat_id, topic_id, day_of_week, start_time, end_time, class_type),
         ).fetchone()
         return dict(row) if row else None
     finally:

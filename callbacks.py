@@ -30,22 +30,22 @@ async def task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     try:
         parts = query.data.split(":")
-        # Strip a trailing ":evt:{id}" origin suffix unconditionally, BEFORE
+        # Strip a trailing ":top:{id}" origin suffix unconditionally, BEFORE
         # any action-specific parsing. A fixed-index check (e.g. parts[3] ==
-        # "evt") breaks for "status", whose own code already occupies index
-        # 3 (task:status:5:ns vs. task:status:5:ns:evt:12) -- stripping from
+        # "top") breaks for "status", whose own code already occupies index
+        # 3 (task:status:5:ns vs. task:status:5:ns:top:12) -- stripping from
         # the end works regardless of how many parts the action itself uses.
-        origin_event_id = None
-        if len(parts) >= 2 and parts[-2] == "evt":
-            origin_event_id = int(parts[-1])
+        origin_topic_id = None
+        if len(parts) >= 2 and parts[-2] == "top":
+            origin_topic_id = int(parts[-1])
             parts = parts[:-2]
 
         action = parts[1]
         task_id = int(parts[2])
 
         def _render_list():
-            if origin_event_id is not None:
-                return commands.build_events_detail_view(chat_id, origin_event_id)
+            if origin_topic_id is not None:
+                return commands.build_events_detail_view(chat_id, origin_topic_id)
             return commands.build_tasks_view(chat_id)
 
         if action == "complete":
@@ -68,7 +68,7 @@ async def task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await query.edit_message_text(
                 f"Editing task #{task_id}: {task['title']}\nCurrent status: {task['status']}",
                 reply_markup=keyboards.task_edit_menu_keyboard(
-                    task_id, origin_event_id=origin_event_id
+                    task_id, origin_topic_id=origin_topic_id
                 ),
             )
 
@@ -125,7 +125,7 @@ async def reminder_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 trigger_datetime_utc=new_trigger_str,
                 message=reminder["message"],
                 linked_task_id=reminder["linked_task_id"],
-                linked_event_id=reminder["linked_event_id"],
+                linked_topic_id=reminder["linked_topic_id"],
             )
             scheduler.schedule_reminder(
                 context.job_queue,
@@ -170,9 +170,8 @@ async def topic_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         if action == "root":
             text, kb = commands.build_topics_root_view(chat_id)
-        elif action == "mod":
-            text, kb = commands.build_topics_module_view(chat_id, int(parts[2]))
-        elif action == "open":
+        elif action in ("mod", "open"):
+            # 'mod' kept as an alias so any stale in-chat buttons still resolve.
             text, kb = commands.build_topics_detail_view(chat_id, int(parts[2]))
         elif action == "notes":
             text, kb = commands.build_topics_notes_view(chat_id, int(parts[2]))
@@ -243,7 +242,9 @@ async def pdf_import_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 if not module_name:
                     failed.append(f"{label} — no course code")
                     continue
-                module = database.get_or_create_module(chat_id, module_name)
+                module = database.get_or_create_topic(
+                    chat_id, module_name, kind="module"
+                )
                 if database.find_matching_schedule_block(
                     chat_id,
                     module["id"],

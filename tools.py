@@ -2,7 +2,7 @@
 
 import logging
 import os
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Callable
 from zoneinfo import ZoneInfo
 
@@ -15,30 +15,24 @@ TOOL_SCHEMAS = [
     {
         "name": "create_task",
         "description": (
-            "Create a new task and tag it to EITHER a module OR an event -- "
-            "exactly one of module_name/event_id must be given. Creates the "
-            "module if it doesn't already exist for this chat; an event must "
-            "already exist (look it up via query_events first, never guess "
-            "the id)."
+            "Create a new task, optionally attached to a topic anywhere in the "
+            "tree (a module, an event, or any freeform topic) via topic_id, or "
+            "left unattached. Look the topic_id up via list_topics first, or "
+            "create it with create_topic; never guess an id. A task without a "
+            "clear home can be left unattached -- ask once if a topic seems "
+            "wanted, but don't force one."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "title": {"type": "string", "description": "Short task title"},
-                "module_name": {
-                    "type": "string",
-                    "description": (
-                        "Module/category to tag this task to, e.g. Algorithms "
-                        "or General if uncategorized. Mutually exclusive with "
-                        "event_id -- give exactly one."
-                    ),
-                },
-                "event_id": {
+                "topic_id": {
                     "type": "integer",
                     "description": (
-                        "id of an existing event to tag this task to (e.g. a "
-                        "hackathon or talk), looked up via query_events. "
-                        "Mutually exclusive with module_name -- give exactly one."
+                        "Optional id of the topic to attach this task to "
+                        "(module/event/any topic). Look it up via list_topics "
+                        "or create it via create_topic. Omit to leave the task "
+                        "unattached."
                     ),
                 },
                 "deadline": {
@@ -74,10 +68,12 @@ TOOL_SCHEMAS = [
                     "type": "string",
                     "enum": ["not_started", "in_progress", "blocked", "done"],
                 },
-                "module_name": {"type": "string"},
-                "event_id": {
+                "topic_id": {
                     "type": "integer",
-                    "description": "Optional -- restrict to tasks under one event",
+                    "description": (
+                        "Optional -- restrict to tasks attached to this topic "
+                        "(look it up via list_topics)"
+                    ),
                 },
                 "deadline_from": {
                     "type": "string",
@@ -138,108 +134,105 @@ TOOL_SCHEMAS = [
                 },
                 "linked_task_id": {
                     "type": "integer",
-                    "description": "Optional task this reminder relates to",
+                    "description": (
+                        "Optional task this reminder relates to. Mutually "
+                        "exclusive with linked_topic_id."
+                    ),
+                },
+                "linked_topic_id": {
+                    "type": "integer",
+                    "description": (
+                        "Optional topic (e.g. an event) this reminder relates "
+                        "to. Mutually exclusive with linked_task_id."
+                    ),
                 },
             },
             "required": ["trigger_datetime", "message"],
         },
     },
     {
-        "name": "list_modules",
+        "name": "list_topic_kinds",
         "description": (
-            "List all existing modules for this chat, with their names and "
-            "colors. Use before creating a new module to avoid duplicates."
+            "List the topic 'kind' labels already in use for this chat "
+            "(canonical ones like course/year/semester/module/component/event "
+            "first). ALWAYS call this before inventing a new kind when creating "
+            "a topic, and reuse an existing kind if one fits (matching is "
+            "case-insensitive) rather than minting a near-duplicate."
         ),
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
-        "name": "create_event",
+        "name": "add_event_reminder",
         "description": (
-            "Create a new event -- a time-boxed activity like a hackathon or "
-            "talk that needs its own tasks/notes but isn't a recurring "
-            "academic module. Unlike modules, events are never auto-created "
-            "by name -- always create one explicitly via this tool."
+            "Add another reminder for an event topic (one that has an "
+            "event_datetime), firing the given number of minutes before it. "
+            "Event topics already get default reminders when created; use this "
+            "to bolt on an extra lead time (e.g. a day before). Look the "
+            "topic_id up via list_topics."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "title": {"type": "string", "description": "Event title"},
-                "type": {
-                    "type": "string",
-                    "enum": ["talk", "hackathon", "other"],
-                },
-                "start_date": {
-                    "type": "string",
-                    "description": "ISO-8601 date YYYY-MM-DD. Optional.",
-                },
-                "end_date": {
-                    "type": "string",
-                    "description": "ISO-8601 date YYYY-MM-DD. Optional.",
-                },
-                "location": {"type": "string", "description": "Optional."},
-            },
-            "required": ["title", "type"],
-        },
-    },
-    {
-        "name": "query_events",
-        "description": (
-            "List events for this chat. Use this to find an event's id "
-            "before tagging a task or topic to it -- never guess an event_id."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "type": {
-                    "type": "string",
-                    "enum": ["talk", "hackathon", "other"],
-                },
-                "upcoming_only": {
-                    "type": "boolean",
-                    "description": (
-                        "Default true -- excludes events that have already "
-                        "ended. Set false to include past events too."
-                    ),
+                "topic_id": {"type": "integer"},
+                "offset_minutes": {
+                    "type": "integer",
+                    "description": "Minutes before the event to fire the reminder",
                 },
             },
-            "required": [],
+            "required": ["topic_id", "offset_minutes"],
         },
     },
     {
         "name": "create_topic",
         "description": (
-            "Create a new topic under a module, or a subtopic under an "
-            "existing topic (to any nesting depth). Creates the module if it "
-            "doesn't already exist. If a matching topic (same name, same "
-            "parent) already exists, returns that one instead of duplicating "
-            "-- but call list_topics first if unsure, since matching is exact "
-            "(case-insensitive) only."
+            "Create a topic anywhere in the unified tree, or return the "
+            "matching one if it already exists (same name, same parent, "
+            "case-insensitive). Everything is a topic: a course, a module, an "
+            "event, a freeform life area, or a subtopic of any of these. Pass "
+            "parent_topic_id to nest it (look the parent up via list_topics -- "
+            "names aren't unique); omit it for a top-level topic. Set `kind` to "
+            "classify it -- call list_topic_kinds first and reuse an existing "
+            "kind rather than inventing a near-duplicate. Use kind='module' for "
+            "an academic subject that appears on the timetable (it gets an "
+            "auto-assigned color). Set event_datetime for a one-off event to "
+            "auto-create reminders before it."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "Topic name, e.g. Backpropagation",
+                    "description": "Topic name, e.g. Backpropagation or SC2001",
                 },
-                "module_name": {
+                "kind": {
                     "type": "string",
                     "description": (
-                        "Module/category this topic belongs to, e.g. Machine "
-                        "Learning. Mutually exclusive with event_id -- give "
-                        "exactly one when creating a TOP-LEVEL topic "
-                        "(parent_topic_id omitted). When creating a SUBTOPIC "
-                        "(parent_topic_id given), omit both -- it inherits "
-                        "its parent's container (module or event) automatically."
+                        "Free-string classifier (canonical: course, year, "
+                        "semester, module, component, event). Call "
+                        "list_topic_kinds first and reuse an existing one if it "
+                        "fits. 'module' triggers timetable color assignment; "
+                        "'event' (or 'event:<type>') marks a one-off event."
                     ),
                 },
-                "event_id": {
-                    "type": "integer",
+                "status": {
+                    "type": "string",
+                    "description": "Optional free-string status for this topic",
+                },
+                "event_datetime": {
+                    "type": "string",
                     "description": (
-                        "id of an existing event this topic belongs to, "
-                        "looked up via query_events. Mutually exclusive with "
-                        "module_name -- give exactly one for a TOP-LEVEL "
-                        "topic; omit both for a subtopic."
+                        "For an event topic: ISO-8601 datetime WITH AN EXPLICIT "
+                        "OFFSET (e.g. 2026-09-01T14:00:00+08:00). Setting it "
+                        "auto-creates reminders before the event."
+                    ),
+                },
+                "reminder_offsets_minutes": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": (
+                        "Optional lead times (minutes before event_datetime) "
+                        "for the auto-created reminders; defaults to [60, 30]. "
+                        "Only meaningful with event_datetime."
                     ),
                 },
                 "parent_topic_id": {
@@ -247,8 +240,7 @@ TOOL_SCHEMAS = [
                     "description": (
                         "id of the parent topic, if this is a subtopic. Look "
                         "it up via list_topics first -- topic names are not "
-                        "unique, so parents must be identified by id, never "
-                        "by name alone."
+                        "unique, so parents must be identified by id."
                     ),
                 },
             },
@@ -258,20 +250,20 @@ TOOL_SCHEMAS = [
     {
         "name": "list_topics",
         "description": (
-            "List topics (and subtopics) for this chat, optionally filtered "
-            "to one module. Each result includes its id and a full "
-            "breadcrumb path, e.g. 'Machine Learning > Neural Nets > "
-            "Backpropagation'. Call this before create_topic with a "
-            "parent_topic_id, before add_note or query_notes (to find the "
-            "target topic_id), and before creating a new topic if you're "
-            "unsure whether a similar one already exists."
+            "List topics for this chat, optionally filtered to one `kind`. "
+            "Each result includes its id, kind, and a full breadcrumb path, "
+            "e.g. 'Machine Learning > Neural Nets > Backpropagation'. Call this "
+            "before create_topic with a parent_topic_id, before add_note or "
+            "query_notes (to find the target topic_id), before attaching a "
+            "task/reminder to a topic, and whenever you're unsure whether a "
+            "similar topic already exists."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "module_name": {
+                "kind": {
                     "type": "string",
-                    "description": "Optional -- restrict to one module",
+                    "description": "Optional -- restrict to topics of this kind",
                 },
             },
             "required": [],
@@ -317,8 +309,8 @@ TOOL_SCHEMAS = [
             "whether they're reference material. Use this to answer "
             "questions like 'what notes do I have on backpropagation' or "
             "'show me my reference material for machine learning'. When "
-            "topic_id is given, notes filed under that topic's subtopics are "
-            "included by default (include_subtopics)."
+            "topic_id is given, only notes filed directly under that topic are "
+            "returned."
         ),
         "input_schema": {
             "type": "object",
@@ -327,13 +319,6 @@ TOOL_SCHEMAS = [
                     "type": "integer",
                     "description": "Look this up via list_topics",
                 },
-                "include_subtopics": {
-                    "type": "boolean",
-                    "description": (
-                        "Default true. Only relevant when topic_id is given."
-                    ),
-                },
-                "module_name": {"type": "string"},
                 "is_reference": {
                     "type": "boolean",
                     "description": (
@@ -528,10 +513,9 @@ TOOL_SCHEMAS = [
 ]
 
 
-def _container_label(row: dict) -> str:
-    """A task/topic/note's display label: whichever of module_name/event_title
-    is actually set (exactly one always is, per the schema's CHECK)."""
-    return row["module_name"] if row["module_name"] is not None else row["event_title"]
+def _task_label(row: dict) -> str:
+    """A task's attachment label: its topic name, or 'unfiled' if unattached."""
+    return row.get("topic_name") or "unfiled"
 
 
 def _handle_create_task(tool_input: dict, chat_id: int, job_queue) -> str:
@@ -545,15 +529,14 @@ def _handle_create_task(tool_input: dict, chat_id: int, job_queue) -> str:
     task = database.create_task(
         chat_id=chat_id,
         title=tool_input["title"],
-        module_name=tool_input.get("module_name"),
-        event_id=tool_input.get("event_id"),
+        topic_id=tool_input.get("topic_id"),
         deadline=deadline_utc,
         status=tool_input.get("status", "not_started"),
     )
     deadline_part = f", due {task['deadline']}" if task["deadline"] else ""
     return (
-        f"Created task #{task['id']} '{task['title']}' under "
-        f"'{_container_label(task)}'{deadline_part}. Status: {task['status']}."
+        f"Created task #{task['id']} '{task['title']}' ({_task_label(task)})"
+        f"{deadline_part}. Status: {task['status']}."
     )
 
 
@@ -564,8 +547,7 @@ def _handle_query_tasks(tool_input: dict, chat_id: int, job_queue) -> str:
     tasks = database.query_tasks(
         chat_id=chat_id,
         status=tool_input.get("status"),
-        module_name=tool_input.get("module_name"),
-        event_id=tool_input.get("event_id"),
+        topic_id=tool_input.get("topic_id"),
         deadline_from=(
             scheduler.format_utc_iso(scheduler.parse_iso_datetime(deadline_from_raw))
             if deadline_from_raw
@@ -584,7 +566,7 @@ def _handle_query_tasks(tool_input: dict, chat_id: int, job_queue) -> str:
     for t in tasks:
         deadline_part = f", deadline {t['deadline']}" if t["deadline"] else ""
         lines.append(
-            f"#{t['id']} [{_container_label(t)}] {t['title']} — "
+            f"#{t['id']} [{_task_label(t)}] {t['title']} — "
             f"status: {t['status']}, progress: {t['progress_pct']}%{deadline_part}"
         )
     return "\n".join(lines)
@@ -635,6 +617,7 @@ def _handle_create_reminder(tool_input: dict, chat_id: int, job_queue) -> str:
         trigger_datetime_utc=trigger_utc_str,
         message=message,
         linked_task_id=tool_input.get("linked_task_id"),
+        linked_topic_id=tool_input.get("linked_topic_id"),
     )
     scheduler.schedule_reminder(
         job_queue, reminder["id"], chat_id, trigger_dt_utc, message
@@ -645,76 +628,100 @@ def _handle_create_reminder(tool_input: dict, chat_id: int, job_queue) -> str:
     )
 
 
-def _handle_list_modules(tool_input: dict, chat_id: int, job_queue) -> str:
-    modules = database.list_modules(chat_id)
-    if not modules:
-        return "No modules yet."
-    return "\n".join(f"{m['name']} ({m['color']})" for m in modules)
+def _handle_list_topic_kinds(tool_input: dict, chat_id: int, job_queue) -> str:
+    kinds = database.list_topic_kinds(chat_id)
+    if not kinds:
+        return "No topic kinds in use yet."
+    return ", ".join(kinds)
 
 
-def _handle_create_event(tool_input: dict, chat_id: int, job_queue) -> str:
-    event = database.create_event(
-        chat_id=chat_id,
-        title=tool_input["title"],
-        type=tool_input["type"],
-        start_date=tool_input.get("start_date"),
-        end_date=tool_input.get("end_date"),
-        location=tool_input.get("location"),
-    )
-    date_part = (
-        f", {event['start_date']} to {event['end_date']}"
-        if event["start_date"] and event["end_date"]
-        else f", {event['start_date']}"
-        if event["start_date"]
-        else ""
-    )
-    location_part = f" at {event['location']}" if event["location"] else ""
-    return (
-        f"Created event #{event['id']} '{event['title']}' "
-        f"({event['type']}){date_part}{location_part}."
-    )
-
-
-def _handle_query_events(tool_input: dict, chat_id: int, job_queue) -> str:
-    events = database.query_events(
-        chat_id=chat_id,
-        type=tool_input.get("type"),
-        upcoming_only=tool_input.get("upcoming_only", True),
-    )
-    if not events:
-        return "No events match those filters."
-    lines = []
-    for e in events:
-        date_part = (
-            f", {e['start_date']} to {e['end_date']}"
-            if e["start_date"] and e["end_date"]
-            else f", {e['start_date']}"
-            if e["start_date"]
-            else ""
+def _schedule_event_reminders(
+    topic: dict, offsets: list[int], chat_id: int, job_queue
+) -> int:
+    """Create + schedule reminders at each lead time (minutes) before a topic's
+    event_datetime, skipping any that would fire in the past. Returns how many
+    were actually scheduled."""
+    if not topic.get("event_datetime"):
+        return 0
+    event_dt = scheduler.parse_iso_datetime(topic["event_datetime"])
+    now = datetime.now(timezone.utc)
+    made = 0
+    for offset in offsets:
+        trigger = event_dt - timedelta(minutes=offset)
+        if trigger <= now:
+            continue
+        message = f"{topic['name']} is coming up (in {offset} min)."
+        reminder = database.create_reminder(
+            chat_id=chat_id,
+            trigger_datetime_utc=scheduler.format_utc_iso(trigger),
+            message=message,
+            linked_topic_id=topic["id"],
         )
-        location_part = f" at {e['location']}" if e["location"] else ""
-        lines.append(f"#{e['id']} {e['title']} ({e['type']}){date_part}{location_part}")
-    return "\n".join(lines)
+        scheduler.schedule_reminder(
+            job_queue, reminder["id"], chat_id, trigger, message
+        )
+        made += 1
+    return made
+
+
+def _handle_add_event_reminder(tool_input: dict, chat_id: int, job_queue) -> str:
+    topic = database.get_topic(chat_id, tool_input["topic_id"])
+    if topic is None:
+        raise ValueError(
+            f"No topic with id {tool_input['topic_id']} found for this chat."
+        )
+    if not topic.get("event_datetime"):
+        raise ValueError(
+            f"Topic #{topic['id']} '{topic['name']}' has no event_datetime, so "
+            "it can't take an event reminder."
+        )
+    offset = tool_input["offset_minutes"]
+    made = _schedule_event_reminders(topic, [offset], chat_id, job_queue)
+    if made == 0:
+        return (
+            f"That time ({offset} min before '{topic['name']}') is already past, "
+            "so no reminder was scheduled."
+        )
+    return f"Added a reminder {offset} min before '{topic['name']}'."
 
 
 def _handle_create_topic(tool_input: dict, chat_id: int, job_queue) -> str:
+    event_datetime_raw = tool_input.get("event_datetime")
+    event_datetime = (
+        scheduler.format_utc_iso(scheduler.parse_iso_datetime(event_datetime_raw))
+        if event_datetime_raw
+        else None
+    )
     topic = database.get_or_create_topic(
         chat_id=chat_id,
         name=tool_input["name"],
-        module_name=tool_input.get("module_name"),
-        event_id=tool_input.get("event_id"),
+        kind=tool_input.get("kind"),
+        status=tool_input.get("status"),
+        event_datetime=event_datetime,
         parent_topic_id=tool_input.get("parent_topic_id"),
     )
     topics = database.list_topics(chat_id)
     path = next((t["path"] for t in topics if t["id"] == topic["id"]), topic["name"])
-    return f"Topic #{topic['id']} ready: {path}."
+
+    reminder_note = ""
+    if topic.get("event_datetime"):
+        offsets = tool_input.get("reminder_offsets_minutes") or \
+            database.DEFAULT_EVENT_REMINDER_OFFSETS
+        made = _schedule_event_reminders(topic, offsets, chat_id, job_queue)
+        if made:
+            reminder_note = f" Scheduled {made} reminder(s) before it."
+    return f"Topic #{topic['id']} ready: {path}.{reminder_note}"
 
 
 def _handle_list_topics(tool_input: dict, chat_id: int, job_queue) -> str:
-    topics = database.list_topics(chat_id, module_name=tool_input.get("module_name"))
+    topics = database.list_topics(chat_id, kind=tool_input.get("kind"))
     if not topics:
         return "No topics yet."
-    return "\n".join(f"#{t['id']} {t['path']}" for t in topics)
+    lines = []
+    for t in topics:
+        kind_part = f" [{t['kind']}]" if t["kind"] else ""
+        lines.append(f"#{t['id']}{kind_part} {t['path']}")
+    return "\n".join(lines)
 
 
 def _handle_add_note(tool_input: dict, chat_id: int, job_queue) -> str:
@@ -728,59 +735,17 @@ def _handle_add_note(tool_input: dict, chat_id: int, job_queue) -> str:
     tag = " (reference)" if note["is_reference"] else ""
     source_part = f", source: {note['source']}" if note["source"] else ""
     return (
-        f"Saved note #{note['id']} under "
-        f"'{_container_label(note)} > {note['topic_name']}'{tag}{source_part}."
+        f"Saved note #{note['id']} under '{note['topic_name']}'{tag}{source_part}."
     )
 
 
 def _handle_query_notes(tool_input: dict, chat_id: int, job_queue) -> str:
-    topic_id = tool_input.get("topic_id")
-    module_name = tool_input.get("module_name")
-    is_reference = tool_input.get("is_reference")
-    limit = tool_input.get("limit", 20)
-    include_subtopics = tool_input.get("include_subtopics", True)
-
-    topic_ids: list[int] | None = None
-    if topic_id is not None:
-        topic_ids = [topic_id]
-        if include_subtopics:
-            all_topics = database.list_topics(chat_id)
-            children_by_parent: dict[int, list[int]] = {}
-            for t in all_topics:
-                if t["parent_topic_id"] is not None:
-                    children_by_parent.setdefault(t["parent_topic_id"], []).append(
-                        t["id"]
-                    )
-            frontier = [topic_id]
-            while frontier:
-                nxt = [
-                    cid for tid in frontier for cid in children_by_parent.get(tid, [])
-                ]
-                topic_ids.extend(nxt)
-                frontier = nxt
-
-    if topic_ids is not None:
-        notes = []
-        for tid in topic_ids:
-            notes.extend(
-                database.query_notes(
-                    chat_id=chat_id,
-                    topic_id=tid,
-                    module_name=module_name,
-                    is_reference=is_reference,
-                    limit=limit,
-                )
-            )
-        notes.sort(key=lambda n: n["created_at"], reverse=True)
-        notes = notes[:limit]
-    else:
-        notes = database.query_notes(
-            chat_id=chat_id,
-            module_name=module_name,
-            is_reference=is_reference,
-            limit=limit,
-        )
-
+    notes = database.query_notes(
+        chat_id=chat_id,
+        topic_id=tool_input.get("topic_id"),
+        is_reference=tool_input.get("is_reference"),
+        limit=tool_input.get("limit", 20),
+    )
     if not notes:
         return "No notes match those filters."
     lines = []
@@ -788,8 +753,7 @@ def _handle_query_notes(tool_input: dict, chat_id: int, job_queue) -> str:
         tag = "[reference] " if n["is_reference"] else ""
         source_part = f" (source: {n['source']})" if n["source"] else ""
         lines.append(
-            f"#{n['id']} [{_container_label(n)} > {n['topic_name']}] "
-            f"{tag}{n['content']}{source_part}"
+            f"#{n['id']} [{n['topic_name']}] {tag}{n['content']}{source_part}"
         )
     return "\n".join(lines)
 
@@ -911,9 +875,8 @@ TOOL_HANDLERS: dict[str, Callable[[dict, int, object], str]] = {
     "query_tasks": _handle_query_tasks,
     "update_task_status": _handle_update_task_status,
     "create_reminder": _handle_create_reminder,
-    "list_modules": _handle_list_modules,
-    "create_event": _handle_create_event,
-    "query_events": _handle_query_events,
+    "list_topic_kinds": _handle_list_topic_kinds,
+    "add_event_reminder": _handle_add_event_reminder,
     "create_topic": _handle_create_topic,
     "list_topics": _handle_list_topics,
     "add_note": _handle_add_note,

@@ -43,7 +43,10 @@ def _recess_weeks(chat_id: int) -> frozenset[int]:
 
 
 def _color_map(chat_id: int) -> dict[str, str]:
-    return {m["name"]: m["color"] for m in database.list_modules(chat_id)}
+    # A module is now a topic with kind='module'; its color still comes from the
+    # shared MODULE_COLOR_PALETTE. Occurrence dicts keep the key name
+    # 'module_name' (sourced from topics.name) so nothing downstream changes.
+    return {m["name"]: m["color"] for m in database.list_topics(chat_id, kind="module")}
 
 
 def _color(color_map: dict[str, str], module_name: str | None) -> str:
