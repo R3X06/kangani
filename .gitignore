@@ -35,3 +35,4 @@ Thumbs.db
 
 # --- Claude Code local state (if any) ---
 .claude/
+*.db.bak

@@ -6,10 +6,13 @@ actively reads/writes modules, tasks, and reminders -- this avoids schema
 migrations when later phases add topics/notes/events functionality.
 """
 
+import logging
 import re
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 DB_PATH = Path(__file__).parent / "kangani.db"
 
@@ -48,8 +51,15 @@ CREATE TABLE IF NOT EXISTS topics (
     status           TEXT,
     event_datetime   TEXT,
     color            TEXT,
-    created_at       TEXT NOT NULL DEFAULT (STRFTIME('%Y-%m-%dT%H:%M:%fZ','now')),
-    UNIQUE (chat_id, parent_topic_id, name COLLATE NOCASE)
+    created_at       TEXT NOT NULL DEFAULT (STRFTIME('%Y-%m-%dT%H:%M:%fZ','now'))
+    -- Uniqueness deliberately does NOT live here as a table constraint. A
+    -- table-level UNIQUE only exists on a FRESH database: _migrate_topics_v2
+    -- builds topics_new and renames it over `topics`, after which
+    -- CREATE TABLE IF NOT EXISTS is a permanent no-op, so a migrated DB would
+    -- silently never get it. It also can't express what we actually want --
+    -- SQLite treats NULLs as distinct, so UNIQUE(chat_id, parent_topic_id,
+    -- name) is toothless at the root, which is exactly where modules and
+    -- events live. See idx_topics_unique_name in _INDEXES.
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -128,6 +138,18 @@ CREATE INDEX IF NOT EXISTS idx_progress_logs_topic   ON progress_logs(topic_id);
 CREATE INDEX IF NOT EXISTS idx_schedule_blocks_chat  ON schedule_blocks(chat_id);
 CREATE INDEX IF NOT EXISTS idx_reminders_chat_status ON reminders(chat_id, status);
 """
+
+# The topic-uniqueness guarantee, as an INDEX rather than a table constraint:
+# an index applies identically to a fresh DB and to one that came through
+# _migrate_topics_v2's table-rename, and COALESCE(parent_topic_id, -1) makes it
+# bind at the root as well (a bare UNIQUE would not -- SQLite NULLs are
+# distinct, so two root topics both named 'CZ2001' would both be accepted).
+# Created separately from _INDEXES because it can legitimately FAIL on a DB that
+# already accumulated duplicates under the old, unenforced schema.
+_TOPIC_UNIQUE_INDEX = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_topics_unique_name "
+    "ON topics (chat_id, COALESCE(parent_topic_id, -1), name COLLATE NOCASE)"
+)
 
 _SCHEMA_VERSION = 2
 # Used only by the legacy drop-and-recreate path, which now fires solely for a
@@ -438,10 +460,38 @@ def init_db() -> None:
         # would trigger the destructive drop-all above on the live DB.
         _migrate_topics_v2(conn)
         conn.executescript(_INDEXES)
+        _ensure_topic_unique_index(conn)
         conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
         conn.commit()
     finally:
         conn.close()
+
+
+def _ensure_topic_unique_index(conn: sqlite3.Connection) -> None:
+    """Add the topic-uniqueness index, tolerating a DB that predates it.
+
+    Duplicate topics were creatable before this index existed (a migrated DB
+    had no uniqueness at all, and root topics were never covered even on a
+    fresh one), so this can fail on a real database. That must not take the bot
+    down on startup: log the offending rows loudly and carry on unindexed --
+    get_or_create_topic's SELECT-then-INSERT still dedups correctly, the index
+    is only the backstop. Merge the duplicates by hand and the index appears on
+    the next start.
+    """
+    try:
+        conn.execute(_TOPIC_UNIQUE_INDEX)
+    except sqlite3.IntegrityError:
+        dupes = conn.execute(
+            "SELECT chat_id, parent_topic_id, name, COUNT(*) AS n, "
+            "GROUP_CONCAT(id) AS ids FROM topics "
+            "GROUP BY chat_id, COALESCE(parent_topic_id, -1), name COLLATE NOCASE "
+            "HAVING n > 1"
+        ).fetchall()
+        logger.error(
+            "Topic uniqueness index NOT created -- duplicate topics already "
+            "exist: %s. Merge them, then restart to enforce uniqueness.",
+            [(d["name"], d["ids"]) for d in dupes],
+        )
 
 
 # --- modules & events are gone --------------------------------------------
@@ -718,11 +768,16 @@ def get_or_create_topic(
             (chat_id, parent_topic_id, name),
         ).fetchone()
         if row:
-            return dict(row)
+            return {**dict(row), "created": False}
 
-        if kind == "module" and color is None:
+        # casefold, not ==: kind is a free string matched case-insensitively
+        # everywhere else (list_topics, list_event_topics), so a kind of
+        # 'Module' must still get a palette colour and must still count toward
+        # the palette cycle -- otherwise two modules can land on the same hue.
+        if (kind or "").casefold() == "module" and color is None:
             existing = conn.execute(
-                "SELECT COUNT(*) FROM topics WHERE chat_id = ? AND kind = 'module'",
+                "SELECT COUNT(*) FROM topics WHERE chat_id = ? "
+                "AND kind COLLATE NOCASE = 'module'",
                 (chat_id,),
             ).fetchone()[0]
             color = MODULE_COLOR_PALETTE[existing % len(MODULE_COLOR_PALETTE)]
@@ -741,13 +796,71 @@ def get_or_create_topic(
                 "AND name = ? COLLATE NOCASE",
                 (chat_id, parent_topic_id, name),
             ).fetchone()
-            return dict(row)
+            return {**dict(row), "created": False}
         row = conn.execute(
             "SELECT * FROM topics WHERE id = ?", (cur.lastrowid,)
         ).fetchone()
-        return dict(row)
+        # `created` is a transient flag, not a column: callers that have a
+        # side effect on creation (create_topic auto-scheduling event
+        # reminders) MUST key off this rather than off the returned row's
+        # contents, or a second identical call re-fires the side effect.
+        return {**dict(row), "created": True}
     finally:
         conn.close()
+
+
+def set_topic_event_datetime(chat_id: int, topic_id: int, event_datetime: str) -> bool:
+    """Set event_datetime on a topic that doesn't have one yet.
+
+    Returns True if it was actually set. Deliberately refuses to overwrite an
+    existing value: reminders are already scheduled against the old one, and
+    silently moving the date underneath them would leave those reminders
+    pointing at a time the user can no longer see. Rescheduling on change is a
+    separate piece of work.
+    """
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            "UPDATE topics SET event_datetime = ? WHERE id = ? AND chat_id = ? "
+            "AND event_datetime IS NULL",
+            (event_datetime, topic_id, chat_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def resolve_module_topic(chat_id: int, module_name: str) -> dict:
+    """Find (or create) the kind='module' topic named `module_name`, ANYWHERE
+    in the tree -- not just at the root.
+
+    get_or_create_topic dedups on (chat_id, parent, name), so calling it with
+    parent_topic_id=None only ever sees root topics. Once a module is filed
+    under a 'semester' or 'year' topic -- the entire point of the unified tree
+    -- a root-scoped lookup misses it and forks a second module topic with the
+    same name and a different auto-colour, which then collides by name in
+    timetable_data's colour map. So: search the whole tree by (name, kind), and
+    only fall back to creating a root topic when there genuinely isn't one.
+
+    Raises on ambiguity rather than picking: two same-named module topics is
+    already a broken state, and silently guessing one is how the timetable
+    silently repaints itself.
+    """
+    matches = [
+        t
+        for t in list_topics(chat_id, kind="module")
+        if t["name"].strip().casefold() == module_name.strip().casefold()
+    ]
+    if len(matches) > 1:
+        paths = ", ".join(f"#{t['id']} {t['path']}" for t in matches)
+        raise ValueError(
+            f"Ambiguous module '{module_name}' -- {len(matches)} module topics "
+            f"share that name ({paths}). Merge them, then retry."
+        )
+    if matches:
+        return matches[0]
+    return get_or_create_topic(chat_id, module_name, kind="module")
 
 
 def get_topic(chat_id: int, topic_id: int) -> dict | None:
@@ -930,9 +1043,7 @@ def create_schedule_block(
     # the PDF import path): a class's module is just a topic with kind='module',
     # resolved/created here so those callers never deal in topic_ids.
     topic_id = (
-        get_or_create_topic(chat_id, module_name, kind="module")["id"]
-        if module_name
-        else None
+        resolve_module_topic(chat_id, module_name)["id"] if module_name else None
     )
     conn = get_connection()
     try:

@@ -703,8 +703,25 @@ def _handle_create_topic(tool_input: dict, chat_id: int, job_queue) -> str:
     topics = database.list_topics(chat_id)
     path = next((t["path"] for t in topics if t["id"] == topic["id"]), topic["name"])
 
+    # Schedule the auto-reminders ONLY on the call that actually inserted the
+    # row. create_topic is advertised to Claude as idempotent (it returns the
+    # existing topic rather than duplicating), so it WILL get called twice for
+    # the same event -- and keying off `topic["event_datetime"]` instead of
+    # `topic["created"]` re-fires the offsets every single time, stacking a
+    # fresh 60/30 pair on each call.
     reminder_note = ""
-    if topic.get("event_datetime"):
+    schedule_for = None
+    if topic["created"] and topic.get("event_datetime"):
+        schedule_for = topic["event_datetime"]
+    elif not topic["created"] and event_datetime and not topic.get("event_datetime"):
+        # Existing topic, no date yet, user is supplying one now: fill it in
+        # (otherwise the date is silently dropped -- get_or_create_topic returns
+        # the existing row untouched) and schedule against it, once.
+        if database.set_topic_event_datetime(chat_id, topic["id"], event_datetime):
+            topic = {**topic, "event_datetime": event_datetime}
+            schedule_for = event_datetime
+
+    if schedule_for:
         offsets = tool_input.get("reminder_offsets_minutes") or \
             database.DEFAULT_EVENT_REMINDER_OFFSETS
         made = _schedule_event_reminders(topic, offsets, chat_id, job_queue)
