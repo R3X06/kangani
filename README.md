@@ -1,86 +1,77 @@
 # Kangani
 
-A Telegram-based personal assistant bot for managing daily life and study — reminders, tasks, topics, and notes, built to feel like a polished app rather than a plain command-line bot.
+A Telegram personal assistant for managing study and daily life — topics, tasks, reminders, notes, and a class timetable — built to feel like a polished app rather than a command-line bot. You talk to it naturally; Claude decides what to store and how to answer.
 
 > Originally prototyped under the placeholder name "Jarvis," renamed to **Kangani**.
 
-## Overview
+## What it does
 
-Kangani is a personal life and study management system that lives inside Telegram. The goal isn't just backend correctness — it's a bot that feels professional and well-structured, with proper navigation (slash commands, persistent keyboards, inline buttons) instead of raw text commands.
+- **One topic tree.** Everything you track — a course, a year, a semester, a module, a one-off event, a freeform life area — is a *topic*, nestable to any depth. Tasks, notes, and reminders attach to a topic (or to nothing at all).
+- **Compositional calendar.** Ask for a topic and Kangani returns everything nested beneath it. `"Y3S1 calendar"` gives the full picture under Y3S1; `"Y3S1 lesson calendar"` narrows to just lessons; `"SC2001 tutorials"` narrows further. Every word before "calendar" is a filter that intersects with the others.
+- **Timetable.** Recurring weekly classes or one-off blocks, with per-class week patterns (odd/even/specific weeks), semester-week numbering, and recess weeks. Rendered as text or as a styled image.
+- **PDF import.** Drop in an NTU registration PDF; Kangani reads the timetable visually (the PDFs use custom-encoded fonts that defeat text extraction) and imports your classes after you confirm a preview.
+- **Categories & tags.** Tasks and lessons carry user-defined categories (assignment, lab, tutorial…) you can filter by. Every task, note, and reminder has a hidden stable tag — add `-tag` to any listing to reveal them.
 
-## Current features
+## How a message flows
 
-- **Reminders** — time-based reminders via PTB's `JobQueue`
-- **Tasks** — task tracking with status
-- **Topics** — organizing study/life topics
-- **Notes** — quick note capture
+`Telegram → bot.py → brain.py (Claude + tool loop) → tools.py → database.py → back to you`
 
-## Currently in progress
-
-Building the navigation layer to make the bot feel polished:
-- Slash command menu (`set_my_commands()`)
-- Persistent reply keyboard
-- Inline buttons
-
-Open design question: should the persistent reply keyboard always be visible, or appear on demand (button-first vs. free-text-first interaction)?
+A nav-button tap short-circuits the LLM and renders a pre-built view directly. Everything else goes to Claude, which decides whether to answer in text or call one or more tools, then replies.
 
 ## Tech stack
 
 | Layer | Choice |
 |---|---|
-| Bot framework | `python-telegram-bot` (PTB) |
-| Scheduling | PTB's built-in `JobQueue` |
-| Database | SQLite (8-table schema) |
-| AI | Anthropic API — Claude Sonnet |
-| Language | Python |
+| Bot framework | `python-telegram-bot` |
+| Scheduling | PTB's built-in `JobQueue` (APScheduler) |
+| Database | SQLite (unified topic tree) |
+| AI | Anthropic API — Claude Sonnet, native tool use |
+| Timetable images | Jinja2 templates + Playwright (Chromium) |
+| PDF import | pdf2image + Claude vision |
 | Timezone | Asia/Singapore |
-| Dev environment | VS Code + Claude Code |
 
-## Project structure
+## Project layout
 
-Five-file Python project structure. *(Fill in actual filenames/layout here as the structure solidifies.)*
+| File | Responsibility |
+|---|---|
+| `bot.py` | Entry point; wires handlers, starts polling |
+| `brain.py` | Claude integration, system prompt, tool-use loop |
+| `tools.py` | Tool schemas + handlers Claude can call |
+| `database.py` | SQLite persistence, schema, migrations |
+| `commands.py` | Slash-command + nav-button views |
+| `callbacks.py` | Inline-button (callback query) handling |
+| `keyboards.py` | Reply- and inline-keyboard builders |
+| `scheduler.py` | Reminder scheduling, week-number logic |
+| `pdf_import.py` | NTU timetable PDF import (vision) |
+| `timetable_data.py` | Assembles data for timetable rendering |
+| `timetable_image.py` | Renders timetable HTML into an image |
+| `templates/` | Daily / weekly / monthly timetable HTML |
+| `test_scheduler_weeks.py` | Tests for week-number / recess logic |
 
 ## Setup
 
 ```bash
-# 1. Clone the repo
-git clone https://github.com/<your-username>/kangani.git
+git clone https://github.com/R3X06/kangani.git
 cd kangani
 
-# 2. Create and activate a virtual environment
 python -m venv venv
-source venv/bin/activate   # on Windows: venv\Scripts\activate
+source venv/bin/activate            # Windows: venv\Scripts\activate
 
-# 3. Install dependencies
 pip install -r requirements.txt
+playwright install chromium         # required for timetable images
 
-# 4. Configure environment variables
-cp .env.example .env
-# then fill in your Telegram bot token and Anthropic API key
-
-# 5. Run the bot
-python main.py   # or your actual entry-point filename
+cp .env.example .env                # then fill in your tokens
+python bot.py
 ```
+
+`.env` needs `TELEGRAM_BOT_TOKEN` (from @BotFather), `ANTHROPIC_API_KEY` (from console.anthropic.com — make sure the workspace has billing set up), and `TIMEZONE`.
 
 ## Roadmap
 
-**Near-term**
-- Slash command menu, persistent keyboard, inline buttons (navigation layer)
-
-**Phase 2+**
-- Location-based reminders with QR arrival tracking
-- PDF schedule import and parsing
-- Spaced repetition nudges and concept dependency mapping
+- Proactive daily digest
+- Location-based reminders
+- Spaced-repetition nudges and concept dependency mapping
 - Energy-aware scheduling
-- OCR for handwritten notes and voice transcription
-- Google Calendar and LMS integration
-- A central "context brain" layer that cross-references all data to answer *"what should I do right now?"*
-
-## Known issues (resolved)
-
-- ✅ Import ordering bug — `.env` was loading after module import
-- ✅ Timezone bug — reminders were firing prematurely
-
-## License
-
-*(Add a license if you plan to make this public, e.g. MIT.)*
+- OCR for handwritten notes, voice transcription
+- Google Calendar / LMS integration
+- A "context brain" that cross-references everything to answer *"what should I do right now?"*
