@@ -118,8 +118,9 @@ def build_notes_view(chat_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
     for n in notes:
         tag = "[reference] " if n["is_reference"] else ""
         source_part = f" (source: {n['source']})" if n["source"] else ""
+        where = n["topic_name"] or "general"
         lines.append(
-            f"#{n['id']} [{n['topic_name']}] {tag}{n['content']}{source_part}"
+            f"#{n['id']} [{where}] {tag}{n['content']}{source_part}"
         )
     return "\n".join(lines), None
 
@@ -443,21 +444,39 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
-        "I'm KANGĀNi, your personal assistant.\n\n"
-        "You can just talk to me naturally -- e.g. \"create a task to finish "
-        "the report by Friday\", \"remind me to call mom at 6pm\", \"note "
-        "under Backpropagation: ...\", or \"what's due this week?\".\n\n"
-        "Or use the menu buttons / commands below for quick navigation:\n"
-        "/today -- today's classes, tasks and reminders\n"
+        "I'm KANGĀNi, your personal assistant. Talk to me naturally -- I sort "
+        "out where things go.\n\n"
+        "CAPTURE\n"
+        "\"add a task to finish the report by Friday\"\n"
+        "\"remind me to call mom at 6pm\"\n"
+        "\"note under Backpropagation: chain rule intuition\"\n"
+        "\"SC2001 lecture Mondays 9-11am at LT1\"\n"
+        "Or drop in your NTU registration PDF and I'll read the timetable.\n\n"
+        "ASK -- combine a topic with what you want to see:\n"
+        "\"Y3S1 calendar\" -- everything under Y3S1 (lessons, tasks, reminders, notes)\n"
+        "\"Y3S1 lesson calendar\" -- just the lessons under it\n"
+        "\"SC2001 tutorials\" -- just SC2001's tutorials\n"
+        "\"my labs this week\" -- every lab, this week\n"
+        "\"what's due\" -- upcoming deadlines\n"
+        "\"general reminders\" -- reminders not tied to anything\n\n"
+        "HOW IT'S ORGANISED\n"
+        "Everything lives in one tree of topics (year > semester > module, or "
+        "any shape you like). Tasks, notes and reminders attach to a topic -- "
+        "or to nothing, as a general item. Ask for a topic and I pull "
+        "everything nested under it. Tasks and lessons can have categories "
+        "(assignment, lab, tutorial...) so you can filter by them. Every item "
+        "has a hidden tag -- add \"-tag\" to any listing to see them.\n\n"
+        "QUICK NAV\n"
+        "/today -- today's lessons, tasks and reminders\n"
         "/week -- this week's timetable (or /week 3 for a specific week)\n"
         "/dayimage /weekimage /monthimage -- the same, as a picture\n"
-        f"{keyboards.TASKS_LABEL} / /tasks -- view and update your tasks\n"
-        f"{keyboards.REMINDERS_LABEL} / /reminders -- view and cancel upcoming reminders\n"
-        f"{keyboards.TOPICS_LABEL} / /topics -- browse your topics and notes\n"
-        f"{keyboards.NOTES_LABEL} / /notes -- view your recent notes\n"
-        f"{keyboards.EVENTS_LABEL} / /events -- browse your events\n"
-        "/menu -- show this menu again\n"
-        "/settings -- view your current settings"
+        f"{keyboards.TASKS_LABEL} / /tasks -- view and update tasks\n"
+        f"{keyboards.REMINDERS_LABEL} / /reminders -- view and cancel reminders\n"
+        f"{keyboards.TOPICS_LABEL} / /topics -- browse topics and notes\n"
+        f"{keyboards.NOTES_LABEL} / /notes -- view recent notes\n"
+        f"{keyboards.EVENTS_LABEL} / /events -- browse events (hackathons, talks)\n"
+        "/menu -- show the menu again\n"
+        "/settings -- view current settings"
     )
     await update.message.reply_text(text)
 

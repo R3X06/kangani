@@ -51,6 +51,20 @@ TOOL_SCHEMAS = [
                     "enum": ["not_started", "in_progress", "blocked", "done"],
                     "description": "Defaults to not_started if omitted",
                 },
+                "category": {
+                    "type": "string",
+                    "description": (
+                        "Optional user-defined subcategory for this task, e.g. "
+                        "'assignment', 'reading', 'admin'. Call "
+                        "list_task_categories FIRST and reuse an existing "
+                        "category if one fits (matching is case-insensitive) "
+                        "rather than minting a near-synonym. If proposing a NEW "
+                        "category, confirm the name with the user before "
+                        "creating -- but create the task immediately regardless "
+                        "(uncategorized if they haven't confirmed yet), never "
+                        "block saving the task on the category question."
+                    ),
+                },
             },
             "required": ["title"],
         },
@@ -72,7 +86,33 @@ TOOL_SCHEMAS = [
                     "type": "integer",
                     "description": (
                         "Optional -- restrict to tasks attached to this topic "
-                        "(look it up via list_topics)"
+                        "(look it up via list_topics). By default this INCLUDES "
+                        "tasks on every topic nested under it (the subtree), so "
+                        "passing a semester or year topic_id returns everything "
+                        "beneath it. Set include_subtopics=false for only tasks "
+                        "on this exact topic."
+                    ),
+                },
+                "include_subtopics": {
+                    "type": "boolean",
+                    "description": (
+                        "Default true. Only relevant when topic_id is given -- "
+                        "false restricts to the exact topic, excluding its "
+                        "subtree."
+                    ),
+                },
+                "category": {
+                    "type": "string",
+                    "description": (
+                        "Optional -- restrict to tasks in this category (see "
+                        "list_task_categories). Case-insensitive."
+                    ),
+                },
+                "show_tags": {
+                    "type": "boolean",
+                    "description": (
+                        "Default false. When true, each task's hidden tag is "
+                        "shown. Only set when the user explicitly asks for tags."
                     ),
                 },
                 "deadline_from": {
@@ -160,6 +200,77 @@ TOOL_SCHEMAS = [
             "case-insensitive) rather than minting a near-duplicate."
         ),
         "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "list_task_categories",
+        "description": (
+            "List the task categories already in use for this chat. ALWAYS "
+            "call this before setting a NEW category on a task, and reuse an "
+            "existing one if it fits (case-insensitive) rather than minting a "
+            "near-synonym. Confirm a genuinely new category with the user "
+            "before creating it (but never block saving the task on that)."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "list_lesson_types",
+        "description": (
+            "List the lesson types (class_type -- lecture, tutorial, lab, "
+            "seminar, etc.) already in use for this chat. ALWAYS call this "
+            "before setting a NEW lesson type on a schedule block, and reuse "
+            "an existing one if it fits (case-insensitive). Also use it to "
+            "resolve a user's lesson-type filter word ('labs', 'tutorials') to "
+            "the exact stored spelling before passing lesson_types to "
+            "query_schedule."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "query_reminders",
+        "description": (
+            "List the chat's pending reminders. scope='general' returns only "
+            "freestanding reminders (linked to no task and no topic) -- use "
+            "for 'my general reminders'. scope='all' (default) returns every "
+            "pending reminder. topic_id (with include_subtopics, default true) "
+            "restricts to reminders linked to that topic and its subtree -- "
+            "e.g. 'Y3S1 reminders'. Combine with query_schedule / query_tasks "
+            "/ query_notes for a full combined calendar. Set show_tags=true "
+            "only when the user explicitly asks to see hidden tags."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "scope": {
+                    "type": "string",
+                    "enum": ["general", "all"],
+                    "description": (
+                        "'general' = unlinked only; 'all' (default) = every "
+                        "pending reminder."
+                    ),
+                },
+                "topic_id": {
+                    "type": "integer",
+                    "description": (
+                        "Optional -- restrict to reminders linked to this topic "
+                        "and its subtree (look it up via list_topics)."
+                    ),
+                },
+                "include_subtopics": {
+                    "type": "boolean",
+                    "description": (
+                        "Default true. false restricts to the exact topic."
+                    ),
+                },
+                "show_tags": {
+                    "type": "boolean",
+                    "description": (
+                        "Default false. When true, each reminder's hidden tag "
+                        "is shown. Only set when the user explicitly asks."
+                    ),
+                },
+            },
+            "required": [],
+        },
     },
     {
         "name": "add_event_reminder",
@@ -272,18 +383,24 @@ TOOL_SCHEMAS = [
     {
         "name": "add_note",
         "description": (
-            "Save a note under an existing topic. Look up the topic_id via "
-            "list_topics first if the user refers to the topic by name -- "
-            "create the topic first with create_topic if none exists yet. "
-            "Mark is_reference=true for reference material (a link, a "
-            "textbook excerpt, a definition worth keeping) as opposed to a "
-            "transient study note or observation (is_reference=false, the "
-            "default)."
+            "Save a note. Attach it to an existing topic via topic_id (look it "
+            "up via list_topics first, or create the topic with create_topic if "
+            "none exists), OR omit topic_id entirely to save a GENERAL note "
+            "attached to nothing -- for a thought or reminder-to-self that "
+            "doesn't belong under any topic. Offer a topic once if one seems "
+            "fitting, but don't force one. Mark is_reference=true for reference "
+            "material (a link, a textbook excerpt, a definition worth keeping) "
+            "vs a transient note (is_reference=false, the default)."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "topic_id": {"type": "integer"},
+                "topic_id": {
+                    "type": "integer",
+                    "description": (
+                        "Optional. Omit for a general note attached to no topic."
+                    ),
+                },
                 "content": {"type": "string", "description": "The note text"},
                 "source": {
                     "type": "string",
@@ -299,18 +416,19 @@ TOOL_SCHEMAS = [
                     ),
                 },
             },
-            "required": ["topic_id", "content"],
+            "required": ["content"],
         },
     },
     {
         "name": "query_notes",
         "description": (
-            "Retrieve notes, optionally filtered by topic, module, and/or "
-            "whether they're reference material. Use this to answer "
-            "questions like 'what notes do I have on backpropagation' or "
-            "'show me my reference material for machine learning'. When "
-            "topic_id is given, only notes filed directly under that topic are "
-            "returned."
+            "Retrieve notes. With no topic_id, returns ALL notes for the chat "
+            "(general and topic-linked alike). With a topic_id, returns notes "
+            "under that topic AND everything nested beneath it (its subtree) by "
+            "default -- so a semester or year topic_id gathers all notes below "
+            "it. Set include_subtopics=false for only notes directly on that "
+            "exact topic. Set show_tags=true only if the user explicitly asks "
+            "to see the hidden reference tags (e.g. 'notes -tag')."
         ),
         "input_schema": {
             "type": "object",
@@ -319,11 +437,27 @@ TOOL_SCHEMAS = [
                     "type": "integer",
                     "description": "Look this up via list_topics",
                 },
+                "include_subtopics": {
+                    "type": "boolean",
+                    "description": (
+                        "Default true. Only relevant when topic_id is given -- "
+                        "false restricts to the exact topic, excluding its "
+                        "subtree."
+                    ),
+                },
                 "is_reference": {
                     "type": "boolean",
                     "description": (
                         "Filter to reference-only (true) or non-reference-only "
                         "(false). Omit for both."
+                    ),
+                },
+                "show_tags": {
+                    "type": "boolean",
+                    "description": (
+                        "Default false. When true, each note's hidden reference "
+                        "tag is shown. Only set when the user explicitly asks "
+                        "for tags."
                     ),
                 },
                 "limit": {
@@ -380,10 +514,15 @@ TOOL_SCHEMAS = [
                 "class_type": {
                     "type": "string",
                     "description": (
-                        "Optional kind of class, e.g. Lecture, Tutorial, Lab, "
-                        "Seminar, Workshop. Set this for timetable classes so a "
-                        "module's lecture and tutorial stay distinguishable. "
-                        "Omit for non-class blocks (gym, errands)."
+                        "Optional lesson type, e.g. Lecture, Tutorial, Lab, "
+                        "Seminar, Workshop. Call list_lesson_types FIRST and "
+                        "reuse an existing one (matching is case-insensitive) "
+                        "rather than minting a near-synonym ('Tut' vs "
+                        "'Tutorial'); confirm a genuinely NEW lesson type with "
+                        "the user before creating. Set this for timetable "
+                        "classes so a module's lecture and tutorial stay "
+                        "distinguishable. Omit for non-lesson blocks (gym, "
+                        "errands)."
                     ),
                 },
                 "location": {
@@ -411,15 +550,19 @@ TOOL_SCHEMAS = [
     {
         "name": "query_schedule",
         "description": (
-            "List schedule blocks. If BOTH date_from and date_to are given, "
-            "recurring blocks are expanded into actual dated occurrences "
+            "List schedule blocks (lessons). If BOTH date_from and date_to are "
+            "given, recurring blocks are expanded into actual dated occurrences "
             "within that range and the result is date-ordered (use this for "
             "'what's on today/this week' -- compute the bounds yourself from "
-            "the current date shown in the system prompt: 'today' is a "
-            "single-day range, 'this week' is Monday-Sunday of the current "
-            "calendar week). If omitted, returns the raw weekly timetable "
-            "plus all one-off blocks, unexpanded (use this for 'what does "
-            "my schedule look like in general')."
+            "the current date shown in the system prompt). If omitted, returns "
+            "the raw weekly timetable plus one-off blocks, unexpanded. "
+            "topic_id (with include_subtopics, default true) restricts to "
+            "lessons under a topic and everything nested beneath it -- this is "
+            "how a 'Y3S1 lesson calendar' works: resolve the topic, pass its "
+            "id. lesson_types further narrows to specific types (e.g. just "
+            "tutorial + lab). This tool covers the LESSON portion of a "
+            "calendar only; combine it with query_tasks / query_notes / "
+            "reminders for a full combined calendar."
         ),
         "input_schema": {
             "type": "object",
@@ -432,9 +575,37 @@ TOOL_SCHEMAS = [
                     "type": "string",
                     "description": "ISO-8601 date YYYY-MM-DD, inclusive upper bound.",
                 },
+                "topic_id": {
+                    "type": "integer",
+                    "description": (
+                        "Optional -- restrict to lessons under this topic and "
+                        "its subtree (look it up via list_topics). Prefer this "
+                        "over module_name for anything above module level (a "
+                        "semester, a year), since it walks the whole subtree."
+                    ),
+                },
+                "include_subtopics": {
+                    "type": "boolean",
+                    "description": (
+                        "Default true. false restricts to the exact topic, "
+                        "excluding its subtree."
+                    ),
+                },
+                "lesson_types": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional -- restrict to these lesson types (e.g. "
+                        "['tutorial','lab']). Case-insensitive. See "
+                        "list_lesson_types for what's in use."
+                    ),
+                },
                 "module_name": {
                     "type": "string",
-                    "description": "Optional -- restrict to one module.",
+                    "description": (
+                        "Optional single-module shortcut. Does NOT walk a "
+                        "subtree -- use topic_id for that."
+                    ),
                 },
             },
             "required": [],
@@ -530,24 +701,29 @@ def _handle_create_task(tool_input: dict, chat_id: int, job_queue) -> str:
         chat_id=chat_id,
         title=tool_input["title"],
         topic_id=tool_input.get("topic_id"),
+        category=tool_input.get("category"),
         deadline=deadline_utc,
         status=tool_input.get("status", "not_started"),
     )
     deadline_part = f", due {task['deadline']}" if task["deadline"] else ""
+    category_part = f", category {task['category']}" if task["category"] else ""
     return (
         f"Created task #{task['id']} '{task['title']}' ({_task_label(task)})"
-        f"{deadline_part}. Status: {task['status']}."
+        f"{category_part}{deadline_part}. Status: {task['status']}."
     )
 
 
 def _handle_query_tasks(tool_input: dict, chat_id: int, job_queue) -> str:
     deadline_from_raw = tool_input.get("deadline_from")
     deadline_to_raw = tool_input.get("deadline_to")
+    show_tags = tool_input.get("show_tags", False)
 
     tasks = database.query_tasks(
         chat_id=chat_id,
         status=tool_input.get("status"),
         topic_id=tool_input.get("topic_id"),
+        include_subtopics=tool_input.get("include_subtopics", True),
+        category=tool_input.get("category"),
         deadline_from=(
             scheduler.format_utc_iso(scheduler.parse_iso_datetime(deadline_from_raw))
             if deadline_from_raw
@@ -565,9 +741,12 @@ def _handle_query_tasks(tool_input: dict, chat_id: int, job_queue) -> str:
     lines = []
     for t in tasks:
         deadline_part = f", deadline {t['deadline']}" if t["deadline"] else ""
+        category_part = f", {t['category']}" if t["category"] else ""
+        tag_part = f" (tag {t['tag']})" if show_tags else ""
         lines.append(
-            f"#{t['id']} [{_task_label(t)}] {t['title']} — "
-            f"status: {t['status']}, progress: {t['progress_pct']}%{deadline_part}"
+            f"#{t['id']}{tag_part} [{_task_label(t)}] {t['title']} — "
+            f"status: {t['status']}, progress: {t['progress_pct']}%"
+            f"{category_part}{deadline_part}"
         )
     return "\n".join(lines)
 
@@ -633,6 +812,46 @@ def _handle_list_topic_kinds(tool_input: dict, chat_id: int, job_queue) -> str:
     if not kinds:
         return "No topic kinds in use yet."
     return ", ".join(kinds)
+
+
+def _handle_list_task_categories(tool_input: dict, chat_id: int, job_queue) -> str:
+    cats = database.list_task_categories(chat_id)
+    if not cats:
+        return "No task categories in use yet."
+    return ", ".join(cats)
+
+
+def _handle_list_lesson_types(tool_input: dict, chat_id: int, job_queue) -> str:
+    types = database.list_class_types(chat_id)
+    if not types:
+        return "No lesson types in use yet."
+    return ", ".join(types)
+
+
+def _handle_query_reminders(tool_input: dict, chat_id: int, job_queue) -> str:
+    show_tags = tool_input.get("show_tags", False)
+    scope = tool_input.get("scope", "all")
+    reminders = database.list_pending_reminders(
+        chat_id=chat_id,
+        scope=scope,
+        topic_id=tool_input.get("topic_id"),
+        include_subtopics=tool_input.get("include_subtopics", True),
+    )
+    if not reminders:
+        if scope == "general":
+            return "No general (unlinked) reminders pending."
+        return "No pending reminders match those filters."
+    tz_name = os.environ.get("TIMEZONE", "UTC")
+    lines = []
+    for r in reminders:
+        local = scheduler.parse_iso_datetime(r["trigger_data"]).astimezone(
+            ZoneInfo(tz_name)
+        )
+        tag_part = f" (tag {r['tag']})" if show_tags else ""
+        lines.append(
+            f"#{r['id']}{tag_part} {local.strftime('%Y-%m-%d %H:%M %z')}: {r['message']}"
+        )
+    return "\n".join(lines)
 
 
 def _schedule_event_reminders(
@@ -744,22 +963,23 @@ def _handle_list_topics(tool_input: dict, chat_id: int, job_queue) -> str:
 def _handle_add_note(tool_input: dict, chat_id: int, job_queue) -> str:
     note = database.create_note(
         chat_id=chat_id,
-        topic_id=tool_input["topic_id"],
         content=tool_input["content"],
+        topic_id=tool_input.get("topic_id"),
         source=tool_input.get("source"),
         is_reference=tool_input.get("is_reference", False),
     )
-    tag = " (reference)" if note["is_reference"] else ""
+    ref = " (reference)" if note["is_reference"] else ""
     source_part = f", source: {note['source']}" if note["source"] else ""
-    return (
-        f"Saved note #{note['id']} under '{note['topic_name']}'{tag}{source_part}."
-    )
+    where = f"under '{note['topic_name']}'" if note["topic_name"] else "as a general note"
+    return f"Saved note #{note['id']} {where}{ref}{source_part}."
 
 
 def _handle_query_notes(tool_input: dict, chat_id: int, job_queue) -> str:
+    show_tags = tool_input.get("show_tags", False)
     notes = database.query_notes(
         chat_id=chat_id,
         topic_id=tool_input.get("topic_id"),
+        include_subtopics=tool_input.get("include_subtopics", True),
         is_reference=tool_input.get("is_reference"),
         limit=tool_input.get("limit", 20),
     )
@@ -767,10 +987,12 @@ def _handle_query_notes(tool_input: dict, chat_id: int, job_queue) -> str:
         return "No notes match those filters."
     lines = []
     for n in notes:
-        tag = "[reference] " if n["is_reference"] else ""
+        ref = "[reference] " if n["is_reference"] else ""
         source_part = f" (source: {n['source']})" if n["source"] else ""
+        where = f"[{n['topic_name']}] " if n["topic_name"] else "[general] "
+        tag_part = f" (tag {n['tag']})" if show_tags else ""
         lines.append(
-            f"#{n['id']} [{n['topic_name']}] {tag}{n['content']}{source_part}"
+            f"#{n['id']}{tag_part} {where}{ref}{n['content']}{source_part}"
         )
     return "\n".join(lines)
 
@@ -809,6 +1031,9 @@ def _handle_query_schedule(tool_input: dict, chat_id: int, job_queue) -> str:
     date_from = tool_input.get("date_from")
     date_to = tool_input.get("date_to")
     module_name = tool_input.get("module_name")
+    topic_id = tool_input.get("topic_id")
+    include_subtopics = tool_input.get("include_subtopics", True)
+    lesson_types = tool_input.get("lesson_types")
 
     if date_from and date_to:
         if (date.fromisoformat(date_to) - date.fromisoformat(date_from)).days > _MAX_SCHEDULE_QUERY_DAYS:
@@ -816,7 +1041,9 @@ def _handle_query_schedule(tool_input: dict, chat_id: int, job_queue) -> str:
                 f"Range too large -- please ask for at most {_MAX_SCHEDULE_QUERY_DAYS} days at a time."
             )
         blocks = database.list_schedule_blocks(
-            chat_id=chat_id, date_from=date_from, date_to=date_to, module_name=module_name
+            chat_id=chat_id, date_from=date_from, date_to=date_to,
+            module_name=module_name, topic_id=topic_id,
+            include_subtopics=include_subtopics, class_types=lesson_types,
         )
         anchor = database.get_semester_anchor(chat_id)
         anchor_date = date.fromisoformat(anchor) if anchor else None
@@ -828,7 +1055,7 @@ def _handle_query_schedule(tool_input: dict, chat_id: int, job_queue) -> str:
         except scheduler.AnchorNotSetError:
             return scheduler.ANCHOR_NOT_SET_MESSAGE
         if not occurrences:
-            return "No schedule blocks in that range."
+            return "No lessons in that range."
         lines = []
         for o in occurrences:
             module_part = f" [{o['module_name']}]" if o["module_name"] else ""
@@ -840,9 +1067,12 @@ def _handle_query_schedule(tool_input: dict, chat_id: int, job_queue) -> str:
             )
         return "\n".join(lines)
 
-    blocks = database.list_schedule_blocks(chat_id=chat_id, module_name=module_name)
+    blocks = database.list_schedule_blocks(
+        chat_id=chat_id, module_name=module_name, topic_id=topic_id,
+        include_subtopics=include_subtopics, class_types=lesson_types,
+    )
     if not blocks:
-        return "No schedule blocks yet."
+        return "No lessons match those filters."
     lines = []
     for b in blocks:
         when = b["day_of_week"] if b["day_of_week"] else b["specific_date"]
@@ -893,6 +1123,9 @@ TOOL_HANDLERS: dict[str, Callable[[dict, int, object], str]] = {
     "update_task_status": _handle_update_task_status,
     "create_reminder": _handle_create_reminder,
     "list_topic_kinds": _handle_list_topic_kinds,
+    "list_task_categories": _handle_list_task_categories,
+    "list_lesson_types": _handle_list_lesson_types,
+    "query_reminders": _handle_query_reminders,
     "add_event_reminder": _handle_add_event_reminder,
     "create_topic": _handle_create_topic,
     "list_topics": _handle_list_topics,

@@ -8,6 +8,7 @@ migrations when later phases add topics/notes/events functionality.
 
 import logging
 import re
+import secrets
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -67,6 +68,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     chat_id       INTEGER NOT NULL,
     topic_id      INTEGER REFERENCES topics(id) ON DELETE CASCADE,
     title         TEXT NOT NULL,
+    category      TEXT,
+    tag           TEXT,
     deadline      TEXT,
     status        TEXT NOT NULL DEFAULT 'not_started'
                     CHECK (status IN ('not_started','in_progress','blocked','done')),
@@ -91,7 +94,9 @@ CREATE TABLE IF NOT EXISTS schedule_blocks (
 
 CREATE TABLE IF NOT EXISTS notes (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    topic_id      INTEGER NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+    chat_id       INTEGER NOT NULL,
+    topic_id      INTEGER REFERENCES topics(id) ON DELETE CASCADE,
+    tag           TEXT,
     source        TEXT,
     content       TEXT NOT NULL,
     is_reference  INTEGER NOT NULL DEFAULT 0 CHECK (is_reference IN (0,1)),
@@ -113,6 +118,7 @@ CREATE TABLE IF NOT EXISTS reminders (
     trigger_data      TEXT NOT NULL,
     linked_task_id    INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
     linked_topic_id   INTEGER REFERENCES topics(id) ON DELETE CASCADE,
+    tag               TEXT,
     status            TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','fired','cancelled')),
     message           TEXT NOT NULL,
     created_at        TEXT NOT NULL DEFAULT (STRFTIME('%Y-%m-%dT%H:%M:%fZ','now')),
@@ -419,6 +425,100 @@ def _migrate_topics_v2(conn: sqlite3.Connection) -> None:
         conn.isolation_level = prev_isolation
 
 
+def _migrate_notes_general(conn: sqlite3.Connection) -> None:
+    """One-time, data-preserving migration making `notes.topic_id` nullable
+    (so a note can be "general" -- attached to nothing) and giving `notes`
+    its own `chat_id`, since a topic-less note has no topic to derive one
+    from.
+
+    SQLite can't relax a column's NOT NULL via ALTER TABLE, so this uses the
+    same create-new-table / copy-rows / drop-old / rename pattern as
+    _migrate_topics_v2. Idempotent: detected by notes.topic_id still being
+    NOT NULL, so a second run (or a fresh DB, built NOT NULL-free by SCHEMA
+    already) is a no-op.
+    """
+    info = conn.execute("PRAGMA table_info(notes)").fetchall()
+    topic_id_col = next((r for r in info if r["name"] == "topic_id"), None)
+    if topic_id_col is None or topic_id_col["notnull"] == 0:
+        return  # fresh DB, or already migrated
+
+    prev_isolation = conn.isolation_level
+    conn.isolation_level = None
+    try:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("BEGIN")
+        conn.execute("DROP TABLE IF EXISTS notes_new")
+        conn.execute("""
+            CREATE TABLE notes_new (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id       INTEGER NOT NULL,
+                topic_id      INTEGER REFERENCES topics(id) ON DELETE CASCADE,
+                tag           TEXT,
+                source        TEXT,
+                content       TEXT NOT NULL,
+                is_reference  INTEGER NOT NULL DEFAULT 0 CHECK (is_reference IN (0,1)),
+                created_at    TEXT NOT NULL DEFAULT (STRFTIME('%Y-%m-%dT%H:%M:%fZ','now'))
+            )
+        """)
+        # Every pre-existing note has a topic_id (it was NOT NULL until now),
+        # so chat_id can always be backfilled from its topic.
+        conn.execute("""
+            INSERT INTO notes_new (id, chat_id, topic_id, source, content, is_reference, created_at)
+            SELECT notes.id, topics.chat_id, notes.topic_id, notes.source,
+                   notes.content, notes.is_reference, notes.created_at
+            FROM notes JOIN topics ON topics.id = notes.topic_id
+        """)
+        conn.execute("DROP TABLE notes")
+        conn.execute("ALTER TABLE notes_new RENAME TO notes")
+
+        broken = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if broken:
+            raise RuntimeError(f"notes migration left dangling references: {broken}")
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.isolation_level = prev_isolation
+
+
+# Hidden reference tags for notes/tasks/reminders: short, random, and stable
+# for the item's whole life -- unlike the auto-increment id, deleting one
+# item never causes another's tag to change or be reassigned. Deliberately
+# NOT the id: an id reveals creation order and total count; a tag doesn't,
+# and stays hidden from normal listings unless the user asks for it.
+_TAG_TABLES = ("notes", "tasks", "reminders")
+
+
+def _new_tag(conn: sqlite3.Connection, table: str) -> str:
+    """Short random alphanumeric tag, unique within `table`. Collisions are
+    astronomically unlikely at this scale (6 hex chars = 16M+ values), but
+    the retry loop makes the guarantee real rather than assumed."""
+    for _ in range(10):
+        candidate = secrets.token_hex(3)
+        exists = conn.execute(
+            f"SELECT 1 FROM {table} WHERE tag = ?", (candidate,)
+        ).fetchone()
+        if not exists:
+            return candidate
+    raise RuntimeError(f"Could not generate a unique tag for {table} after 10 tries")
+
+
+def _backfill_tags(conn: sqlite3.Connection) -> None:
+    """Assign a tag to any pre-existing note/task/reminder that predates the
+    tag column. Additive and idempotent -- only touches rows where tag IS
+    NULL, so every run after the first is a no-op."""
+    for table in _TAG_TABLES:
+        rows = conn.execute(f"SELECT id FROM {table} WHERE tag IS NULL").fetchall()
+        for row in rows:
+            conn.execute(
+                f"UPDATE {table} SET tag = ? WHERE id = ?",
+                (_new_tag(conn, table), row["id"]),
+            )
+    conn.commit()
+
+
 def init_db() -> None:
     """Create the schema, or reset it if it's behind _SCHEMA_VERSION.
 
@@ -453,14 +553,24 @@ def init_db() -> None:
         # e.g. "7" or "7,14"; NULL/empty means none. Nullable, added additively
         # so it never disturbs an existing (possibly live) chat_settings row.
         _ensure_column(conn, "chat_settings", "recess_weeks", "TEXT")
+        # Task's user-set subcategory (mirrors topics.kind) and the hidden
+        # reference tags -- additive/nullable so existing rows are untouched
+        # until _backfill_tags runs below.
+        _ensure_column(conn, "tasks", "category", "TEXT")
+        _ensure_column(conn, "tasks", "tag", "TEXT")
+        _ensure_column(conn, "reminders", "tag", "TEXT")
         conn.commit()
         # One-time, data-preserving collapse of modules/events into the topics
         # tree. Runs in place on an existing DB; a no-op once done or on a fresh
         # DB. Deliberately NOT gated behind a _SCHEMA_VERSION bump, because that
         # would trigger the destructive drop-all above on the live DB.
         _migrate_topics_v2(conn)
+        # Same reasoning: notes.topic_id -> nullable, notes gets its own
+        # chat_id. Also not gated behind _SCHEMA_VERSION -- see docstring.
+        _migrate_notes_general(conn)
         conn.executescript(_INDEXES)
         _ensure_topic_unique_index(conn)
+        _backfill_tags(conn)
         conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
         conn.commit()
     finally:
@@ -519,10 +629,37 @@ def _require_topic(conn: sqlite3.Connection, chat_id: int, topic_id: int) -> Non
         raise ValueError(f"No topic with id {topic_id} found for this chat.")
 
 
+def get_topic_subtree_ids(conn: sqlite3.Connection, chat_id: int, topic_id: int) -> list[int]:
+    """topic_id plus every topic nested under it, at any depth (BFS down
+    parent_topic_id). This is THE mechanism behind "give me everything under
+    Y3S1" -- every topic-scoped query (schedule, tasks, notes, reminders)
+    walks the same subtree via this function, so "topic_id, and optionally
+    its whole subtree" behaves identically everywhere instead of each query
+    having its own bespoke (and previously inconsistent, sometimes broken)
+    notion of what a topic "contains".
+
+    Takes an open connection rather than opening its own, since every caller
+    already has one open and wants this as one step inside a larger query,
+    not a separate round trip.
+    """
+    ids = [topic_id]
+    frontier = [topic_id]
+    while frontier:
+        placeholders = ",".join("?" * len(frontier))
+        children = conn.execute(
+            f"SELECT id FROM topics WHERE chat_id = ? AND parent_topic_id IN ({placeholders})",
+            (chat_id, *frontier),
+        ).fetchall()
+        frontier = [r["id"] for r in children]
+        ids.extend(frontier)
+    return ids
+
+
 def create_task(
     chat_id: int,
     title: str,
     topic_id: int | None = None,
+    category: str | None = None,
     deadline: str | None = None,
     status: str = "not_started",
 ) -> dict:
@@ -530,10 +667,11 @@ def create_task(
     try:
         if topic_id is not None:
             _require_topic(conn, chat_id, topic_id)
+        tag = _new_tag(conn, "tasks")
         cur = conn.execute(
-            "INSERT INTO tasks (chat_id, topic_id, title, deadline, status) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (chat_id, topic_id, title, deadline, status),
+            "INSERT INTO tasks (chat_id, topic_id, title, category, tag, deadline, status) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (chat_id, topic_id, title, category, tag, deadline, status),
         )
         conn.commit()
         row = conn.execute(
@@ -590,6 +728,8 @@ def query_tasks(
     chat_id: int,
     status: str | None = None,
     topic_id: int | None = None,
+    include_subtopics: bool = True,
+    category: str | None = None,
     deadline_from: str | None = None,
     deadline_to: str | None = None,
     limit: int = 20,
@@ -603,8 +743,16 @@ def query_tasks(
             clauses.append("tasks.status = ?")
             params.append(status)
         if topic_id is not None:
-            clauses.append("tasks.topic_id = ?")
-            params.append(topic_id)
+            if include_subtopics:
+                subtree = get_topic_subtree_ids(conn, chat_id, topic_id)
+                clauses.append(f"tasks.topic_id IN ({','.join('?' * len(subtree))})")
+                params.extend(subtree)
+            else:
+                clauses.append("tasks.topic_id = ?")
+                params.append(topic_id)
+        if category is not None:
+            clauses.append("tasks.category = ? COLLATE NOCASE")
+            params.append(category)
         if deadline_from is not None:
             clauses.append("tasks.deadline >= ?")
             params.append(deadline_from)
@@ -620,6 +768,23 @@ def query_tasks(
         )
         rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def list_task_categories(chat_id: int) -> list[str]:
+    """Distinct task categories already in use for this chat -- call before
+    create_task with a new category so a synonym doesn't fragment the set
+    (e.g. 'assignment' vs 'Assignment' vs 'homework' all meaning the same
+    thing). Mirrors list_topic_kinds for the same reason."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT category FROM tasks "
+            "WHERE chat_id = ? AND category IS NOT NULL AND category <> ''",
+            (chat_id,),
+        ).fetchall()
+        return sorted({r["category"] for r in rows})
     finally:
         conn.close()
 
@@ -649,10 +814,11 @@ def create_reminder(
         if linked_topic_id is not None:
             _require_topic(conn, chat_id, linked_topic_id)
 
+        tag = _new_tag(conn, "reminders")
         cur = conn.execute(
             "INSERT INTO reminders (chat_id, type, trigger_data, message, "
-            "linked_task_id, linked_topic_id) VALUES (?, 'time', ?, ?, ?, ?)",
-            (chat_id, trigger_datetime_utc, message, linked_task_id, linked_topic_id),
+            "linked_task_id, linked_topic_id, tag) VALUES (?, 'time', ?, ?, ?, ?, ?)",
+            (chat_id, trigger_datetime_utc, message, linked_task_id, linked_topic_id, tag),
         )
         conn.commit()
         row = conn.execute(
@@ -719,14 +885,40 @@ def cancel_reminder(chat_id: int, reminder_id: int) -> dict | None:
         conn.close()
 
 
-def list_pending_reminders(chat_id: int) -> list[dict]:
+def list_pending_reminders(
+    chat_id: int,
+    scope: str = "all",
+    topic_id: int | None = None,
+    include_subtopics: bool = True,
+) -> list[dict]:
+    """scope='general' restricts to reminders with no linked task or topic --
+    the freestanding ones, e.g. "just general reminders". scope='all' (the
+    default) returns every pending reminder regardless of what it's linked
+    to. topic_id further restricts to reminders linked to that topic (or its
+    subtree, by default) -- mutually meaningful with scope='all' only, since
+    a general reminder is by definition linked to no topic.
+    """
+    if scope not in ("general", "all"):
+        raise ValueError(f"scope must be 'general' or 'all', got {scope!r}")
     conn = get_connection()
     try:
-        rows = conn.execute(
-            "SELECT * FROM reminders WHERE chat_id = ? AND status = 'pending' "
-            "ORDER BY trigger_data ASC",
-            (chat_id,),
-        ).fetchall()
+        clauses = ["chat_id = ?", "status = 'pending'"]
+        params: list = [chat_id]
+        if scope == "general":
+            clauses.append("linked_task_id IS NULL AND linked_topic_id IS NULL")
+        if topic_id is not None:
+            if include_subtopics:
+                subtree = get_topic_subtree_ids(conn, chat_id, topic_id)
+                clauses.append(f"linked_topic_id IN ({','.join('?' * len(subtree))})")
+                params.extend(subtree)
+            else:
+                clauses.append("linked_topic_id = ?")
+                params.append(topic_id)
+        sql = (
+            f"SELECT * FROM reminders WHERE {' AND '.join(clauses)} "
+            "ORDER BY trigger_data ASC"
+        )
+        rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
@@ -952,23 +1144,28 @@ def list_event_topics(chat_id: int, upcoming_only: bool = True) -> list[dict]:
 
 def create_note(
     chat_id: int,
-    topic_id: int,
     content: str,
+    topic_id: int | None = None,
     source: str | None = None,
     is_reference: bool = False,
 ) -> dict:
+    """topic_id omitted -> a "general" note, attached to nothing. Scoped by
+    notes.chat_id directly rather than derived from a topic, since a general
+    note has no topic to derive it from."""
     conn = get_connection()
     try:
-        _require_topic(conn, chat_id, topic_id)
+        if topic_id is not None:
+            _require_topic(conn, chat_id, topic_id)
+        tag = _new_tag(conn, "notes")
         cur = conn.execute(
-            "INSERT INTO notes (topic_id, source, content, is_reference) "
-            "VALUES (?, ?, ?, ?)",
-            (topic_id, source, content, 1 if is_reference else 0),
+            "INSERT INTO notes (chat_id, topic_id, tag, source, content, is_reference) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (chat_id, topic_id, tag, source, content, 1 if is_reference else 0),
         )
         conn.commit()
         row = conn.execute(
             "SELECT notes.*, topics.name AS topic_name "
-            "FROM notes JOIN topics ON topics.id = notes.topic_id "
+            "FROM notes LEFT JOIN topics ON topics.id = notes.topic_id "
             "WHERE notes.id = ?",
             (cur.lastrowid,),
         ).fetchone()
@@ -980,16 +1177,25 @@ def create_note(
 def query_notes(
     chat_id: int,
     topic_id: int | None = None,
+    include_subtopics: bool = True,
     is_reference: bool | None = None,
     limit: int = 20,
 ) -> list[dict]:
+    """topic_id omitted -> every note for this chat, general and topic-linked
+    alike. Pass topic_id with include_subtopics=False to see only notes on
+    that exact topic, not ones nested underneath it."""
     conn = get_connection()
     try:
-        clauses = ["topics.chat_id = ?"]
+        clauses = ["notes.chat_id = ?"]
         params: list = [chat_id]
         if topic_id is not None:
-            clauses.append("notes.topic_id = ?")
-            params.append(topic_id)
+            if include_subtopics:
+                subtree = get_topic_subtree_ids(conn, chat_id, topic_id)
+                clauses.append(f"notes.topic_id IN ({','.join('?' * len(subtree))})")
+                params.extend(subtree)
+            else:
+                clauses.append("notes.topic_id = ?")
+                params.append(topic_id)
         if is_reference is not None:
             clauses.append("notes.is_reference = ?")
             params.append(1 if is_reference else 0)
@@ -998,7 +1204,7 @@ def query_notes(
         sql = (
             "SELECT notes.*, topics.name AS topic_name "
             "FROM notes "
-            "JOIN topics ON topics.id = notes.topic_id "
+            "LEFT JOIN topics ON topics.id = notes.topic_id "
             f"WHERE {' AND '.join(clauses)} "
             "ORDER BY notes.created_at DESC LIMIT ?"
         )
@@ -1071,28 +1277,72 @@ def list_schedule_blocks(
     date_from: str | None = None,
     date_to: str | None = None,
     module_name: str | None = None,
+    topic_id: int | None = None,
+    include_subtopics: bool = True,
+    class_types: list[str] | None = None,
 ) -> list[dict]:
+    """topic_id (with include_subtopics, the default) is the general-purpose
+    filter -- "everything under Y3S1" resolves Y3S1 to a topic_id and walks
+    its subtree, catching every module and class nested underneath it.
+    module_name is kept only as a quick single-module shortcut for simple
+    cases; it does NOT walk a subtree the way topic_id does. class_types
+    filters to specific lesson types (e.g. just tutorial + lab) once you
+    already know which topics/modules you're looking at.
+    """
     conn = get_connection()
     try:
+        clauses = ["schedule_blocks.chat_id = ?"]
+        params: list = [chat_id]
+        clauses.append(
+            "(schedule_blocks.day_of_week IS NOT NULL "
+            "OR ((? IS NULL OR schedule_blocks.specific_date >= ?) "
+            "    AND (? IS NULL OR schedule_blocks.specific_date <= ?)))"
+        )
+        params.extend([date_from, date_from, date_to, date_to])
+        if topic_id is not None:
+            if include_subtopics:
+                subtree = get_topic_subtree_ids(conn, chat_id, topic_id)
+                clauses.append(
+                    f"schedule_blocks.topic_id IN ({','.join('?' * len(subtree))})"
+                )
+                params.extend(subtree)
+            else:
+                clauses.append("schedule_blocks.topic_id = ?")
+                params.append(topic_id)
+        elif module_name is not None:
+            clauses.append("topics.name = ? COLLATE NOCASE")
+            params.append(module_name)
+        if class_types:
+            placeholders = ",".join("?" * len(class_types))
+            clauses.append(f"schedule_blocks.class_type COLLATE NOCASE IN ({placeholders})")
+            params.extend(class_types)
+
         sql = (
             "SELECT schedule_blocks.*, topics.name AS module_name FROM schedule_blocks "
             "LEFT JOIN topics ON topics.id = schedule_blocks.topic_id "
-            "WHERE schedule_blocks.chat_id = ? "
-            "AND (schedule_blocks.day_of_week IS NOT NULL "
-            "     OR ((? IS NULL OR schedule_blocks.specific_date >= ?) "
-            "         AND (? IS NULL OR schedule_blocks.specific_date <= ?))) "
-            "AND (? IS NULL OR topics.name = ? COLLATE NOCASE) "
+            f"WHERE {' AND '.join(clauses)} "
             "ORDER BY schedule_blocks.specific_date IS NULL, schedule_blocks.specific_date, "
             "schedule_blocks.day_of_week, schedule_blocks.start_time"
         )
-        params = (
-            chat_id,
-            date_from, date_from,
-            date_to, date_to,
-            module_name, module_name,
-        )
         rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def list_class_types(chat_id: int) -> list[str]:
+    """Distinct lesson types (class_type) already in use for this chat --
+    call before create_schedule_block with a new one so 'Tut' and 'Tutorial'
+    don't end up as two different types for the same thing. Mirrors
+    list_topic_kinds / list_task_categories."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT class_type FROM schedule_blocks "
+            "WHERE chat_id = ? AND class_type IS NOT NULL AND class_type <> ''",
+            (chat_id,),
+        ).fetchall()
+        return sorted({r["class_type"] for r in rows})
     finally:
         conn.close()
 
