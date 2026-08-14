@@ -1,6 +1,7 @@
 # --- Secrets & config ---
 .env
 .env.*
+!.env.example
 *.key
 
 # --- Python ---
@@ -36,3 +37,7 @@ Thumbs.db
 # --- Claude Code local state (if any) ---
 .claude/
 *.db.bak
+
+# --- Local debugging scratch files ---
+body.json
+diff.txt
