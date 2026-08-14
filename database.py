@@ -7,6 +7,7 @@ migrations when later phases add topics/notes/events functionality.
 """
 
 import logging
+import os
 import re
 import secrets
 import sqlite3
@@ -15,7 +16,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = Path(__file__).parent / "kangani.db"
+DB_PATH = Path(os.environ.get("DB_PATH", str(Path(__file__).parent / "kangani.db")))
 
 
 def _now_utc_iso() -> str:

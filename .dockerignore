@@ -1,0 +1,15 @@
+.env
+.env.*
+!.env.example
+*.db
+*.db.bak
+*.db-wal
+*.db-shm
+venv/
+.venv/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+body.json
+diff.txt
