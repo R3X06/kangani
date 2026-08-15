@@ -110,6 +110,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if await file_storage.handle_file_upload_reply(update, context):
         return
 
+    # Rename / nickname / add-subtopic replies answering a topic-screen prompt.
+    if await callbacks.handle_topic_edit_reply(update, context):
+        return
+
     chat_id = update.effective_chat.id
     user_text = update.message.text
     history = context.chat_data.setdefault("history", [])
@@ -190,6 +194,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(callbacks.topic_callback, pattern=r"^topic:"))
     application.add_handler(CallbackQueryHandler(callbacks.event_callback, pattern=r"^event:"))
     application.add_handler(CallbackQueryHandler(callbacks.pdf_import_callback, pattern=r"^pdfimport:"))
+    application.add_handler(CallbackQueryHandler(callbacks.settings_callback, pattern=r"^settings:"))
 
     application.add_error_handler(error_handler)
 

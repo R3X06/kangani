@@ -80,13 +80,26 @@ def build_topics_detail_view(
     if topic is None:
         return "That topic no longer exists.", None
     subtopics = [t for t in topics if t["parent_topic_id"] == topic_id]
-    # Back to the parent topic, or to the root list for a top-level topic.
+    counts = database.get_topic_counts(chat_id, topic_id)
+
+    lines = [topic["path"]]
+    meta = []
+    if topic.get("kind"):
+        meta.append(topic["kind"])
+    if topic.get("full_name"):
+        meta.append(topic["full_name"])
+    if topic.get("nickname"):
+        meta.append(f"aka {topic['nickname']}")
+    if meta:
+        lines.append(" · ".join(meta))
+    text = "\n".join(lines)
+
     if topic["parent_topic_id"] is not None:
         back_target = f"topic:open:{topic['parent_topic_id']}"
     else:
         back_target = "topic:root"
-    return topic["path"], keyboards.topic_detail_keyboard(
-        topic_id, subtopics, back_target
+    return text, keyboards.topic_detail_keyboard(
+        topic_id, subtopics, counts, back_target
     )
 
 
@@ -108,6 +121,40 @@ def build_topics_notes_view(
             lines.append(f"{tag}{n['content']}{source_part}")
         text = "\n".join(lines)
     return text, keyboards.topic_notes_keyboard(topic_id)
+
+
+def build_topic_files_view(
+    chat_id: int, topic_id: int
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    topics = database.list_topics(chat_id)
+    if not any(t["id"] == topic_id for t in topics):
+        return "That topic no longer exists.", None
+    files = database.list_files(chat_id=chat_id, topic_id=topic_id)
+    if not files:
+        text = "No files under this topic yet. Send me a document to file here."
+    else:
+        lines = []
+        for f in files:
+            name = f.get("nickname") or f.get("file_name") or "file"
+            lines.append(f"#{f['id']} {name}")
+        text = "Files under this topic (and below):\n" + "\n".join(lines)
+    return text, keyboards.topic_files_keyboard(topic_id, files)
+
+
+def build_topic_delete_confirm_view(
+    chat_id: int, topic_id: int
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    topic = database.get_topic(chat_id, topic_id)
+    if topic is None:
+        return "That topic no longer exists.", None
+    counts = database.get_topic_counts(chat_id, topic_id)
+    bits = [f"{v} {k}" for k, v in counts.items() if v]
+    detail = ("This also deletes everything under it: " + ", ".join(bits) + "."
+              if bits else "It has nothing else under it.")
+    text = (
+        f"Delete '{topic['name']}'?\n{detail}\nThis cannot be undone."
+    )
+    return text, keyboards.topic_delete_confirm_keyboard(topic_id)
 
 
 def build_notes_view(chat_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
@@ -486,18 +533,31 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
     tz_name = os.environ.get("TIMEZONE", "UTC")
-    anchor = database.get_semester_anchor(update.effective_chat.id)
+    anchor = database.get_semester_anchor(chat_id)
     anchor_line = (
         f"Semester week 1 starts: {anchor}"
         if anchor
         else "Semester week 1 starts: not set (tell me which date week 1 begins)"
     )
+    fmt = database.get_timetable_label_format(chat_id)
+    recess = database.get_recess_weeks(chat_id)
+    recess_line = (
+        f"Recess weeks: {', '.join(str(w) for w in recess)}" if recess
+        else "Recess weeks: none set"
+    )
     text = (
         f"Timezone: {tz_name} (server-configured)\n"
-        f"{anchor_line}"
+        f"{anchor_line}\n"
+        f"{recess_line}\n"
+        f"Timetable labels: {fmt}\n\n"
+        "Change any of these just by telling me (e.g. \"week 1 starts 12 Aug\", "
+        "\"use nicknames on the timetable\")."
     )
-    await update.message.reply_text(text)
+    await update.message.reply_text(
+        text, reply_markup=keyboards.settings_keyboard()
+    )
 
 
 async def nav_button_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

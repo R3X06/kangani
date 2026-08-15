@@ -1460,6 +1460,38 @@ def get_topic(chat_id: int, topic_id: int) -> dict | None:
         conn.close()
 
 
+def get_topic_counts(chat_id: int, topic_id: int) -> dict:
+    """Live counts of what's attached anywhere under a topic (its whole
+    subtree) -- direct children topics, plus lessons/tasks/notes/reminders/
+    files across the subtree. Powers the topic detail screen's tappable
+    counts. Uses the same subtree walk as every scoped query, so a count and
+    the drill-in it leads to can never disagree."""
+    conn = get_connection()
+    try:
+        subtree = get_topic_subtree_ids(conn, chat_id, topic_id)
+        ph = ",".join("?" * len(subtree))
+
+        def count(table: str, col: str = "topic_id") -> int:
+            return conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE {col} IN ({ph})", subtree
+            ).fetchone()[0]
+
+        direct_children = conn.execute(
+            "SELECT COUNT(*) FROM topics WHERE chat_id = ? AND parent_topic_id = ?",
+            (chat_id, topic_id),
+        ).fetchone()[0]
+        return {
+            "subtopics": direct_children,
+            "lessons": count("schedule_blocks"),
+            "tasks": count("tasks"),
+            "notes": count("notes"),
+            "reminders": count("reminders", "linked_topic_id"),
+            "files": count("files"),
+        }
+    finally:
+        conn.close()
+
+
 def list_topics(chat_id: int, kind: str | None = None) -> list[dict]:
     """All of a chat's topics (each with a computed root->leaf `path`), or only
     those of a given kind. The path is always resolved against the full tree, so

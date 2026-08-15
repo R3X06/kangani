@@ -161,6 +161,30 @@ async def reminder_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.answer("Something went wrong with that button.", show_alert=True)
 
 
+async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    chat_id = update.effective_chat.id
+    try:
+        step = query.data.split(":")[2]
+        if step == "1":
+            await query.edit_message_text(
+                "Delete ALL your data — every topic, task, note, reminder, "
+                "lesson, and file? This cannot be undone.",
+                reply_markup=keyboards.settings_delete_all_confirm_keyboard(),
+            )
+        elif step == "cancel":
+            await query.edit_message_text("Cancelled — nothing was deleted.")
+        elif step == "2":
+            counts = database.delete_all_data(chat_id)
+            total = sum(counts.values())
+            await query.edit_message_text(
+                f"Done. Removed {total} items across everything. Fresh start."
+            )
+        await query.answer()
+    except (IndexError, ValueError, KeyError):
+        await query.answer("Something went wrong.", show_alert=True)
+
+
 async def topic_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     chat_id = update.effective_chat.id
@@ -176,14 +200,93 @@ async def topic_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             text, kb = commands.build_topics_detail_view(chat_id, int(parts[2]))
         elif action == "notes":
             text, kb = commands.build_topics_notes_view(chat_id, int(parts[2]))
+        elif action == "files":
+            text, kb = commands.build_topic_files_view(chat_id, int(parts[2]))
+        elif action == "getfile":
+            # Re-send one stored file by its row id.
+            file_row_id = int(parts[2])
+            files = [f for f in database.list_files(chat_id) if f["id"] == file_row_id]
+            if files:
+                import file_storage
+                await file_storage.send_files(context, chat_id, files)
+                await query.answer("Sent.")
+            else:
+                await query.answer("That file is gone.", show_alert=True)
+            return
+        elif action == "del":
+            text, kb = commands.build_topic_delete_confirm_view(chat_id, int(parts[2]))
+        elif action == "delyes":
+            topic_id = int(parts[2])
+            result = database.delete_topic(chat_id, topic_id)
+            bits = [f"{v} {k}" for k, v in result["counts"].items() if v and k != "topics"]
+            extra = (" (plus " + ", ".join(bits) + ")") if bits else ""
+            await query.edit_message_text(
+                f"Deleted '{result['name']}'{extra}."
+            )
+            await query.answer()
+            return
+        elif action in ("rename", "nick", "addsub"):
+            # These need a text reply. Stash what we're waiting for; the reply
+            # is intercepted in bot.py's message_handler (the tool loop can't
+            # reach context.chat_data). Mirrors the pdf-import / file-upload
+            # pending-reply pattern.
+            topic_id = int(parts[2])
+            prompts = {
+                "rename": "Reply with the new name for this topic.",
+                "nick": "Reply with a nickname for this topic (e.g. Y1, DSA).",
+                "addsub": "Reply with the name of the new subtopic to create here.",
+            }
+            context.chat_data["topic_edit_awaiting"] = {"action": action, "topic_id": topic_id}
+            await query.answer()
+            await query.message.reply_text(prompts[action])
+            return
         else:
             await query.answer()
             return
 
         await query.edit_message_text(text, reply_markup=kb)
         await query.answer()
-    except (IndexError, ValueError, KeyError):
+    except ValueError as exc:
+        await query.answer(str(exc)[:190], show_alert=True)
+    except (IndexError, KeyError):
         await query.answer("Something went wrong with that button.", show_alert=True)
+
+
+async def handle_topic_edit_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Intercept a plain-text reply that answers a rename/nickname/add-subtopic
+    prompt. Returns True if consumed. Kept in callbacks (not commands) since it
+    sits alongside topic_callback which issues the prompts."""
+    awaiting = context.chat_data.get("topic_edit_awaiting")
+    if not awaiting:
+        return False
+    chat_id = update.effective_chat.id
+    text = (update.message.text or "").strip()
+    topic_id = awaiting["topic_id"]
+    action = awaiting["action"]
+    context.chat_data.pop("topic_edit_awaiting", None)
+
+    if not text:
+        await update.message.reply_text("That was empty — nothing changed.")
+        return True
+    try:
+        if action == "rename":
+            database.set_topic_names(chat_id, topic_id, name=text)
+            msg = f"Renamed to '{text}'."
+        elif action == "nick":
+            database.set_topic_names(chat_id, topic_id, nickname=text)
+            msg = f"Nicknamed '{text}'."
+        else:  # addsub
+            child = database.get_or_create_topic(
+                chat_id, text, parent_topic_id=topic_id
+            )
+            msg = f"Created subtopic '{child['name']}'."
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return True
+
+    view_text, kb = commands.build_topics_detail_view(chat_id, topic_id)
+    await update.message.reply_text(f"{msg}\n\n{view_text}", reply_markup=kb)
+    return True
 
 
 def _entry_label(e: dict) -> str:
