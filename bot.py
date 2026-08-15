@@ -88,6 +88,13 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None or update.message.text is None:
+        # Edited messages, channel posts, and non-text updates route through
+        # here too since filters.TEXT matches update.effective_message, not
+        # specifically a NEW message -- update.message is None for those.
+        # Silently ignore rather than respond to an edit as if it were new.
+        return
+
     chat_id = update.effective_chat.id
     user_text = update.message.text
     history = context.chat_data.setdefault("history", [])
