@@ -94,7 +94,15 @@ EXTRACTION_SYSTEM_PROMPT = (
     "separately -- each course_code + week_label_raw pairing is its own "
     "schedule_entries object, even when the day/time is identical to another "
     "entry right next to it. NEVER merge two different course codes into one "
-    "entry, and never let one entry's week_label_raw absorb another's."
+    "entry, and never let one entry's week_label_raw absorb another's.\n"
+    "- Be EXHAUSTIVE. Scan the grid column by column (each weekday) and within "
+    "each column top to bottom, emitting a schedule_entries object for EVERY "
+    "coloured/filled block you see -- do not stop after the first per course. "
+    "A course commonly appears MULTIPLE times across the week (e.g. a lecture "
+    "on Monday AND a lab on Wednesday); each occurrence is a separate entry. "
+    "Missing a block is worse than any other error, so when unsure whether a "
+    "faint or partial block is a class, INCLUDE it -- the user reviews and "
+    "edits the list before anything is saved."
 )
 
 
@@ -335,17 +343,50 @@ EDITABLE_FIELDS = {
 # --- import-root resolution (the "which topic do these go under" step) ----
 
 def match_topics_by_name(chat_id: int, text: str) -> list[dict]:
-    """Exact, case-insensitive match against every topic's own name. Returns
-    every match (there can be more than one -- topic names aren't globally
-    unique across different parents) so the caller can disambiguate rather
-    than guess. Deliberately does NOT do the "Y3S1" shorthand-decomposition
-    trick brain.py's prompt uses -- that's a judgment call suited to an LLM
-    reasoning over ambiguity, not a deterministic matcher backing a Telegram
-    button flow where precision matters (this determines where a whole
-    semester's worth of modules land).
-    """
+    """Resolve a typed topic reference to matching topic(s) for the import root
+    picker. Tries, in order:
+      1. exact case-insensitive match on a topic's name OR nickname;
+      2. failing that, shorthand decomposition -- "Y1S1" splits into a nested
+         path "Y1" > "S1" where each piece matches a name or nickname and each
+         is a child of the previous, resolving to the innermost topic.
+    Returns every candidate so the caller can disambiguate a genuine tie rather
+    than guess. Shorthand was originally left out here (see git history) to keep
+    the button flow deterministic -- but real use showed users naturally type
+    "Y1S1" at this prompt exactly as they do in chat, so the decomposition is
+    done deterministically here too rather than surprising them with a miss."""
+    topics = database.list_topics(chat_id)
+
+    def name_or_nick(t: dict, s: str) -> bool:
+        if t["name"].strip().casefold() == s:
+            return True
+        return bool(t.get("nickname")) and t["nickname"].strip().casefold() == s
+
     s = text.strip().casefold()
-    return [t for t in database.list_topics(chat_id) if t["name"].strip().casefold() == s]
+    exact = [t for t in topics if name_or_nick(t, s)]
+    if exact:
+        return exact
+
+    # Shorthand decomposition: try every way of splitting the string into a
+    # sequence of pieces that each match a topic nested under the previous.
+    by_id = {t["id"]: t for t in topics}
+
+    def resolve(remaining: str, parent_id):
+        # Try progressively longer prefixes as the next path piece.
+        results = []
+        for cut in range(1, len(remaining) + 1):
+            piece = remaining[:cut].strip().casefold()
+            if not piece:
+                continue
+            for t in topics:
+                if t.get("parent_topic_id") == parent_id and name_or_nick(t, piece):
+                    rest = remaining[cut:]
+                    if not rest.strip():
+                        results.append(t)
+                    else:
+                        results.extend(resolve(rest, t["id"]))
+        return results
+
+    return resolve(text.strip(), None)
 
 
 # --- preview rendering (mirrors build_week_view's day/row style) -----------
@@ -378,8 +419,21 @@ def build_import_preview(result: dict) -> str:
         root_line,
         f"{len(courses)} courses found — {registered} registered, {waitlisted} waitlisted",
         f"{len(entries)} weekly class blocks found",
-        "",
     ]
+
+    # Per-course lesson count -- surfaces a vision miss (e.g. only 1 SC2001
+    # block extracted when the timetable clearly has 2) BEFORE the user
+    # confirms, rather than being discovered days later. Compare this against
+    # your actual timetable; if a course shows fewer lessons than you know it
+    # has, cancel and re-upload, or add the missing ones by just telling me.
+    per_course: dict[str, int] = {}
+    for e in entries:
+        code = e.get("course_code") or "?"
+        per_course[code] = per_course.get(code, 0) + 1
+    if per_course:
+        summary = ", ".join(f"{c}: {n}" for c, n in sorted(per_course.items()))
+        lines.append(f"Per course — {summary}")
+    lines.append("")
 
     by_day: dict[str, list[dict]] = {}
     for e in entries:

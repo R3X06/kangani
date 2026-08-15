@@ -152,15 +152,10 @@ async def handle_file_upload_reply(
 
 
 def _match_topics(chat_id: int, text: str) -> list[dict]:
-    """Exact case-insensitive match against a topic's name OR nickname."""
-    s = text.strip().casefold()
-    out = []
-    for t in database.list_topics(chat_id):
-        if t["name"].strip().casefold() == s:
-            out.append(t)
-        elif t.get("nickname") and t["nickname"].strip().casefold() == s:
-            out.append(t)
-    return out
+    """Exact name/nickname match, then Y1S1-style shorthand -- delegates to the
+    same resolver the PDF import uses so both upload flows behave identically."""
+    import pdf_import
+    return pdf_import.match_topics_by_name(chat_id, text)
 
 
 async def send_files(
