@@ -313,7 +313,20 @@ TOOL_SCHEMAS = [
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "Topic name, e.g. Backpropagation or SC2001",
+                    "description": (
+                        "Short display name/code, e.g. SC2001 or Backpropagation "
+                        "-- used for lookups, breadcrumbs, and the 'code' "
+                        "timetable label format."
+                    ),
+                },
+                "full_name": {
+                    "type": "string",
+                    "description": (
+                        "Optional official/long name, e.g. 'Data Structures and "
+                        "Algorithms'. Separate from `name` -- both are kept, "
+                        "never overwriting each other. Use set_topic_names to "
+                        "edit either after creation."
+                    ),
                 },
                 "kind": {
                     "type": "string",
@@ -356,6 +369,84 @@ TOOL_SCHEMAS = [
                 },
             },
             "required": ["name"],
+        },
+    },
+    {
+        "name": "set_topic_names",
+        "description": (
+            "Edit a topic's name (short display/code), full_name (official "
+            "long title), and/or nickname (a custom short label the user "
+            "chose). Only pass the field(s) being changed -- omitted fields "
+            "are left as-is. This OVERWRITES the given field(s), unlike "
+            "create_topic's fill-only behavior on an existing match."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "topic_id": {
+                    "type": "integer",
+                    "description": "Look this up via list_topics",
+                },
+                "name": {"type": "string"},
+                "full_name": {"type": "string"},
+                "nickname": {"type": "string"},
+            },
+            "required": ["topic_id"],
+        },
+    },
+    {
+        "name": "move_topic",
+        "description": (
+            "Reparent an existing topic -- move it to sit under a different "
+            "parent (or to the root, if new_parent_topic_id is omitted). Use "
+            "this when a topic was created in the wrong place (e.g. a module "
+            "imported from a PDF landed at the root and needs to move under a "
+            "semester). Look up both ids via list_topics first. Refuses to "
+            "create a cycle (can't move a topic under itself or its own "
+            "subtopic)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "topic_id": {
+                    "type": "integer",
+                    "description": "The topic to move.",
+                },
+                "new_parent_topic_id": {
+                    "type": "integer",
+                    "description": "Omit to move the topic to the root.",
+                },
+            },
+            "required": ["topic_id"],
+        },
+    },
+    {
+        "name": "set_timetable_label_format",
+        "description": (
+            "Set the STANDING default label format used for /dayimage, "
+            "/weekimage, /monthimage, and /today /week (these are direct "
+            "slash commands, not routed through you, so they always use this "
+            "saved preference rather than a per-message instruction). Call "
+            "this when the user asks to change how modules are labeled going "
+            "forward, e.g. 'show my timetable images with just course codes' "
+            "or 'use my nicknames on the timetable'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "label_format": {
+                    "type": "string",
+                    "enum": ["code", "full_name", "nickname", "code_nickname", "code_full_name"],
+                    "description": (
+                        "code = SC2001. full_name = the official long title. "
+                        "nickname = the user's custom short label. "
+                        "code_nickname = 'SC2001: <nickname>'. "
+                        "code_full_name = 'SC2001: <full title>'. Falls back to "
+                        "code if the requested field isn't set on a given topic."
+                    ),
+                },
+            },
+            "required": ["label_format"],
         },
     },
     {
@@ -607,6 +698,16 @@ TOOL_SCHEMAS = [
                         "subtree -- use topic_id for that."
                     ),
                 },
+                "label_format": {
+                    "type": "string",
+                    "enum": ["code", "full_name", "nickname", "code_nickname", "code_full_name"],
+                    "description": (
+                        "Optional ad-hoc override for THIS request only (e.g. "
+                        "the user asks 'show full names just this once'). "
+                        "Omit to use the chat's saved default (see "
+                        "set_timetable_label_format)."
+                    ),
+                },
             },
             "required": [],
         },
@@ -828,6 +929,42 @@ def _handle_list_lesson_types(tool_input: dict, chat_id: int, job_queue) -> str:
     return ", ".join(types)
 
 
+def _handle_set_topic_names(tool_input: dict, chat_id: int, job_queue) -> str:
+    topic = database.set_topic_names(
+        chat_id=chat_id,
+        topic_id=tool_input["topic_id"],
+        name=tool_input.get("name"),
+        full_name=tool_input.get("full_name"),
+        nickname=tool_input.get("nickname"),
+    )
+    parts = [f"name={topic['name']}"]
+    if topic.get("full_name"):
+        parts.append(f"full_name={topic['full_name']}")
+    if topic.get("nickname"):
+        parts.append(f"nickname={topic['nickname']}")
+    return f"Updated topic #{topic['id']}: " + ", ".join(parts)
+
+
+def _handle_move_topic(tool_input: dict, chat_id: int, job_queue) -> str:
+    topic = database.move_topic(
+        chat_id=chat_id,
+        topic_id=tool_input["topic_id"],
+        new_parent_topic_id=tool_input.get("new_parent_topic_id"),
+    )
+    topics = database.list_topics(chat_id)
+    path = next((t["path"] for t in topics if t["id"] == topic["id"]), topic["name"])
+    return f"Moved topic #{topic['id']} -- now at: {path}"
+
+
+def _handle_set_timetable_label_format(tool_input: dict, chat_id: int, job_queue) -> str:
+    database.set_timetable_label_format(chat_id, tool_input["label_format"])
+    return (
+        f"Timetable label format set to '{tool_input['label_format']}' -- this "
+        "applies to /dayimage, /weekimage, /monthimage, /today, and /week "
+        "going forward."
+    )
+
+
 def _handle_query_reminders(tool_input: dict, chat_id: int, job_queue) -> str:
     show_tags = tool_input.get("show_tags", False)
     scope = tool_input.get("scope", "all")
@@ -914,6 +1051,7 @@ def _handle_create_topic(tool_input: dict, chat_id: int, job_queue) -> str:
     topic = database.get_or_create_topic(
         chat_id=chat_id,
         name=tool_input["name"],
+        full_name=tool_input.get("full_name"),
         kind=tool_input.get("kind"),
         status=tool_input.get("status"),
         event_datetime=event_datetime,
@@ -1034,6 +1172,7 @@ def _handle_query_schedule(tool_input: dict, chat_id: int, job_queue) -> str:
     topic_id = tool_input.get("topic_id")
     include_subtopics = tool_input.get("include_subtopics", True)
     lesson_types = tool_input.get("lesson_types")
+    label_format = tool_input.get("label_format") or database.get_timetable_label_format(chat_id)
 
     if date_from and date_to:
         if (date.fromisoformat(date_to) - date.fromisoformat(date_from)).days > _MAX_SCHEDULE_QUERY_DAYS:
@@ -1058,7 +1197,8 @@ def _handle_query_schedule(tool_input: dict, chat_id: int, job_queue) -> str:
             return "No lessons in that range."
         lines = []
         for o in occurrences:
-            module_part = f" [{o['module_name']}]" if o["module_name"] else ""
+            label = database.resolve_label(o, label_format)
+            module_part = f" [{label}]" if label else ""
             class_part = f" {o['class_type']}" if o["class_type"] else ""
             location_part = f" at {o['location']}" if o["location"] else ""
             lines.append(
@@ -1076,7 +1216,8 @@ def _handle_query_schedule(tool_input: dict, chat_id: int, job_queue) -> str:
     lines = []
     for b in blocks:
         when = b["day_of_week"] if b["day_of_week"] else b["specific_date"]
-        module_part = f" [{b['module_name']}]" if b["module_name"] else ""
+        label = database.resolve_label(b, label_format)
+        module_part = f" [{label}]" if label else ""
         class_part = f" {b['class_type']}" if b["class_type"] else ""
         location_part = f" at {b['location']}" if b["location"] else ""
         lines.append(
@@ -1128,6 +1269,9 @@ TOOL_HANDLERS: dict[str, Callable[[dict, int, object], str]] = {
     "query_reminders": _handle_query_reminders,
     "add_event_reminder": _handle_add_event_reminder,
     "create_topic": _handle_create_topic,
+    "set_topic_names": _handle_set_topic_names,
+    "move_topic": _handle_move_topic,
+    "set_timetable_label_format": _handle_set_timetable_label_format,
     "list_topics": _handle_list_topics,
     "add_note": _handle_add_note,
     "query_notes": _handle_query_notes,

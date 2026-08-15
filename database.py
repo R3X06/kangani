@@ -49,6 +49,8 @@ CREATE TABLE IF NOT EXISTS topics (
     chat_id          INTEGER NOT NULL,
     parent_topic_id  INTEGER REFERENCES topics(id) ON DELETE CASCADE,
     name             TEXT NOT NULL,
+    full_name        TEXT,
+    nickname         TEXT,
     kind             TEXT,
     status           TEXT,
     event_datetime   TEXT,
@@ -128,7 +130,8 @@ CREATE TABLE IF NOT EXISTS reminders (
 
 CREATE TABLE IF NOT EXISTS chat_settings (
     chat_id                   INTEGER PRIMARY KEY,
-    semester_week1_start_date TEXT
+    semester_week1_start_date TEXT,
+    timetable_label_format    TEXT NOT NULL DEFAULT 'code'
 );
 """
 
@@ -560,6 +563,16 @@ def init_db() -> None:
         _ensure_column(conn, "tasks", "category", "TEXT")
         _ensure_column(conn, "tasks", "tag", "TEXT")
         _ensure_column(conn, "reminders", "tag", "TEXT")
+        # Separate naming fields: `name` stays the canonical/display identifier
+        # (matching, breadcrumbs, and the 'code' label format); full_name is
+        # the official long title; nickname is a user-chosen short label.
+        # None of these ever overwrite each other -- see resolve_label.
+        _ensure_column(conn, "topics", "full_name", "TEXT")
+        _ensure_column(conn, "topics", "nickname", "TEXT")
+        # DEFAULT only applies to NEW rows on ALTER TABLE ADD COLUMN in SQLite
+        # -- pre-existing chat_settings rows get NULL here, so
+        # get_timetable_label_format treats NULL the same as 'code'.
+        _ensure_column(conn, "chat_settings", "timetable_label_format", "TEXT")
         conn.commit()
         # One-time, data-preserving collapse of modules/events into the topics
         # tree. Runs in place on an existing DB; a no-op once done or on a fresh
@@ -941,6 +954,7 @@ def get_or_create_topic(
     event_datetime: str | None = None,
     color: str | None = None,
     parent_topic_id: int | None = None,
+    full_name: str | None = None,
 ) -> dict:
     """Fetch or create a topic anywhere in the tree.
 
@@ -949,6 +963,12 @@ def get_or_create_topic(
     'module' topic with no explicit color is auto-assigned the next
     MODULE_COLOR_PALETTE hue (so timetable colors keep working); other kinds
     are left uncolored.
+
+    full_name (the official long title, as opposed to `name` -- the short
+    code/display identifier) is FILL-ONLY on an existing match: an automated
+    caller (PDF import re-running) never clobbers a full_name the user may
+    have hand-edited via set_topic_names. To overwrite it deliberately, use
+    set_topic_names instead.
     """
     conn = get_connection()
     try:
@@ -961,6 +981,15 @@ def get_or_create_topic(
             (chat_id, parent_topic_id, name),
         ).fetchone()
         if row:
+            if full_name and not row["full_name"]:
+                conn.execute(
+                    "UPDATE topics SET full_name = ? WHERE id = ?",
+                    (full_name, row["id"]),
+                )
+                conn.commit()
+                row = conn.execute(
+                    "SELECT * FROM topics WHERE id = ?", (row["id"],)
+                ).fetchone()
             return {**dict(row), "created": False}
 
         # casefold, not ==: kind is a free string matched case-insensitively
@@ -977,9 +1006,10 @@ def get_or_create_topic(
 
         try:
             cur = conn.execute(
-                "INSERT INTO topics (chat_id, parent_topic_id, name, kind, status, "
-                "event_datetime, color) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (chat_id, parent_topic_id, name, kind, status, event_datetime, color),
+                "INSERT INTO topics (chat_id, parent_topic_id, name, full_name, "
+                "kind, status, event_datetime, color) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (chat_id, parent_topic_id, name, full_name, kind, status,
+                 event_datetime, color),
             )
             conn.commit()
         except sqlite3.IntegrityError:
@@ -998,6 +1028,119 @@ def get_or_create_topic(
         # reminders) MUST key off this rather than off the returned row's
         # contents, or a second identical call re-fires the side effect.
         return {**dict(row), "created": True}
+    finally:
+        conn.close()
+
+
+def set_topic_names(
+    chat_id: int,
+    topic_id: int,
+    name: str | None = None,
+    full_name: str | None = None,
+    nickname: str | None = None,
+) -> dict:
+    """Explicitly set a topic's name / full_name / nickname. Unlike
+    get_or_create_topic's fill-only behavior (safe for automated imports),
+    this OVERWRITES whatever's given -- it's only called from a direct user
+    request, so overwriting is the correct, expected behavior here. Only the
+    fields actually passed are touched; omit a field to leave it as-is."""
+    conn = get_connection()
+    try:
+        _require_topic(conn, chat_id, topic_id)
+        sets, params = [], []
+        if name is not None:
+            sets.append("name = ?"); params.append(name)
+        if full_name is not None:
+            sets.append("full_name = ?"); params.append(full_name)
+        if nickname is not None:
+            sets.append("nickname = ?"); params.append(nickname)
+        if sets:
+            params.extend([topic_id, chat_id])
+            conn.execute(
+                f"UPDATE topics SET {', '.join(sets)} WHERE id = ? AND chat_id = ?",
+                params,
+            )
+            conn.commit()
+        row = conn.execute(
+            "SELECT * FROM topics WHERE id = ?", (topic_id,)
+        ).fetchone()
+        return dict(row)
+    finally:
+        conn.close()
+
+
+def move_topic(chat_id: int, topic_id: int, new_parent_topic_id: int | None) -> dict:
+    """Reparent a topic -- the capability that was missing entirely before
+    this. new_parent_topic_id=None moves it to the root. Refuses to create a
+    cycle (moving a topic under itself or one of its own descendants), which
+    would otherwise silently corrupt every subtree walk that depends on the
+    tree actually being a tree."""
+    conn = get_connection()
+    try:
+        _require_topic(conn, chat_id, topic_id)
+        if new_parent_topic_id is not None:
+            _require_topic(conn, chat_id, new_parent_topic_id)
+            descendants = set(get_topic_subtree_ids(conn, chat_id, topic_id))
+            if new_parent_topic_id in descendants:
+                raise ValueError(
+                    "Can't move a topic under itself or one of its own "
+                    "subtopics -- that would create a cycle."
+                )
+        conn.execute(
+            "UPDATE topics SET parent_topic_id = ? WHERE id = ? AND chat_id = ?",
+            (new_parent_topic_id, topic_id, chat_id),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM topics WHERE id = ?", (topic_id,)).fetchone()
+        return dict(row)
+    finally:
+        conn.close()
+
+
+def resolve_label(row: dict, label_format: str) -> str | None:
+    """Given a row with name/full_name/nickname (a topic, or a schedule_block
+    joined against topics), return the display label for the requested
+    format. Always falls back to `name` (the code) if the requested field
+    isn't set -- a missing full_name/nickname should never render as blank
+    or None in a timetable."""
+    name = row.get("module_name") or row.get("name")
+    full_name = row.get("module_full_name") or row.get("full_name")
+    nickname = row.get("module_nickname") or row.get("nickname")
+    if label_format == "full_name":
+        return full_name or name
+    if label_format == "nickname":
+        return nickname or name
+    if label_format == "code_nickname":
+        return f"{name}: {nickname}" if nickname else name
+    if label_format == "code_full_name":
+        return f"{name}: {full_name}" if full_name else name
+    return name  # 'code' (default) and any unrecognized format
+
+
+def get_timetable_label_format(chat_id: int) -> str:
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT timetable_label_format FROM chat_settings WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+        return (row["timetable_label_format"] if row else None) or "code"
+    finally:
+        conn.close()
+
+
+def set_timetable_label_format(chat_id: int, label_format: str) -> None:
+    valid = {"code", "full_name", "nickname", "code_nickname", "code_full_name"}
+    if label_format not in valid:
+        raise ValueError(f"label_format must be one of {valid}, got {label_format!r}")
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO chat_settings (chat_id, timetable_label_format) VALUES (?, ?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET timetable_label_format = excluded.timetable_label_format",
+            (chat_id, label_format),
+        )
+        conn.commit()
     finally:
         conn.close()
 
@@ -1024,7 +1167,9 @@ def set_topic_event_datetime(chat_id: int, topic_id: int, event_datetime: str) -
         conn.close()
 
 
-def resolve_module_topic(chat_id: int, module_name: str) -> dict:
+def resolve_module_topic(
+    chat_id: int, module_name: str, full_name: str | None = None
+) -> dict:
     """Find (or create) the kind='module' topic named `module_name`, ANYWHERE
     in the tree -- not just at the root.
 
@@ -1035,6 +1180,10 @@ def resolve_module_topic(chat_id: int, module_name: str) -> dict:
     same name and a different auto-colour, which then collides by name in
     timetable_data's colour map. So: search the whole tree by (name, kind), and
     only fall back to creating a root topic when there genuinely isn't one.
+
+    full_name is filled in (never overwritten) on whichever match is found --
+    this is how re-importing a schedule PDF backfills the official course
+    title onto a module you already created and nested by hand.
 
     Raises on ambiguity rather than picking: two same-named module topics is
     already a broken state, and silently guessing one is how the timetable
@@ -1052,8 +1201,10 @@ def resolve_module_topic(chat_id: int, module_name: str) -> dict:
             f"share that name ({paths}). Merge them, then retry."
         )
     if matches:
+        if full_name and not matches[0].get("full_name"):
+            return set_topic_names(chat_id, matches[0]["id"], full_name=full_name)
         return matches[0]
-    return get_or_create_topic(chat_id, module_name, kind="module")
+    return get_or_create_topic(chat_id, module_name, kind="module", full_name=full_name)
 
 
 def get_topic(chat_id: int, topic_id: int) -> dict | None:
@@ -1263,7 +1414,9 @@ def create_schedule_block(
         )
         conn.commit()
         row = conn.execute(
-            "SELECT schedule_blocks.*, topics.name AS module_name FROM schedule_blocks "
+            "SELECT schedule_blocks.*, topics.name AS module_name, "
+            "topics.full_name AS module_full_name, topics.nickname AS module_nickname "
+            "FROM schedule_blocks "
             "LEFT JOIN topics ON topics.id = schedule_blocks.topic_id "
             "WHERE schedule_blocks.id = ?",
             (cur.lastrowid,),
@@ -1319,7 +1472,9 @@ def list_schedule_blocks(
             params.extend(class_types)
 
         sql = (
-            "SELECT schedule_blocks.*, topics.name AS module_name FROM schedule_blocks "
+            "SELECT schedule_blocks.*, topics.name AS module_name, "
+            "topics.full_name AS module_full_name, topics.nickname AS module_nickname "
+            "FROM schedule_blocks "
             "LEFT JOIN topics ON topics.id = schedule_blocks.topic_id "
             f"WHERE {' AND '.join(clauses)} "
             "ORDER BY schedule_blocks.specific_date IS NULL, schedule_blocks.specific_date, "
@@ -1352,7 +1507,9 @@ def delete_schedule_block(chat_id: int, schedule_block_id: int) -> dict | None:
     conn = get_connection()
     try:
         row = conn.execute(
-            "SELECT schedule_blocks.*, topics.name AS module_name FROM schedule_blocks "
+            "SELECT schedule_blocks.*, topics.name AS module_name, "
+            "topics.full_name AS module_full_name, topics.nickname AS module_nickname "
+            "FROM schedule_blocks "
             "LEFT JOIN topics ON topics.id = schedule_blocks.topic_id "
             "WHERE schedule_blocks.id = ? AND schedule_blocks.chat_id = ?",
             (schedule_block_id, chat_id),

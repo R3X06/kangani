@@ -15,7 +15,8 @@ logger = logging.getLogger(__name__)
 
 MODEL = "claude-sonnet-5"
 MAX_TOKENS = 2048
-MAX_TOOL_ITERATIONS = 5
+MAX_TOOL_ITERATIONS = 10  # combined calendars can chain topic-lookup +
+# query_schedule + query_tasks + query_notes + query_reminders in one turn
 HISTORY_LIMIT = 20  # ~10 turns, trimmed after each response
 
 _client: AsyncAnthropic | None = None
@@ -102,6 +103,15 @@ all of them:
 Resolves via list_topics to that topic AND everything nested beneath it (its \
 subtree). Pass it as topic_id with include_subtopics=true (the default). If \
 NO topic is named, scope is everything the user owns -- no topic filter.
+
+SCOPE SHORTHAND: if a scope word doesn't match any single topic name exactly, \
+but decomposes into a sequence of topics that ARE nested inside each other \
+(e.g. "Y3S1" doesn't exist as a topic, but "Y3" and "S1" do, and "S1" is a \
+child of "Y3"), resolve it as that nested path -- scope is the innermost one \
+("S1" under "Y3"), same as if the user had said "Y3 S1" or "S1 under Y3". Try \
+this decomposition BEFORE concluding a scope word is unrecognized. Only fall \
+through to "I don't recognize that word" if no such nested-path decomposition \
+exists either.
 
 2. CONTENT TYPE -- which of lessons / tasks / notes / reminders to return. \
 If the user names a type ("lessons", "classes", "tasks", "deadlines", \
@@ -222,6 +232,31 @@ change them, or call add_event_reminder later to add another lead time). \
 Create events with create_topic like any other topic, and attach tasks/notes \
 to them by topic_id -- look the id up via list_topics, never guess it.
 
+A topic has THREE independent name fields, never overwriting each other: \
+`name` (short display/code, e.g. "SC2001" -- used for matching and \
+breadcrumbs), `full_name` (the official long title, e.g. "Data Structures and \
+Algorithms" -- set it whenever you learn one, such as from a schedule PDF's \
+course title), and `nickname` (a short label the USER chose, e.g. "DSA" -- \
+only set this when the user explicitly gives one, never invent one). Use \
+set_topic_names to edit any of these after creation; it overwrites the given \
+field(s), unlike create_topic's fill-only behavior on an existing match.
+
+If a topic was created in the wrong place in the tree (e.g. a module a PDF \
+import landed at the root, or the user just wants to reorganize), use \
+move_topic to reparent it -- look up both the topic and its new parent via \
+list_topics first, never guess the ids.
+
+How a module's name is DISPLAYED in a timetable listing or image is a \
+separate question from which name field is stored -- controlled by \
+label_format: 'code' (the default), 'full_name', 'nickname', 'code_nickname' \
+("SC2001: DSA"), or 'code_full_name'. query_schedule takes an optional \
+label_format for a one-off request ("show full names just this once"). But \
+/dayimage, /weekimage, /monthimage, /today, and /week are direct slash \
+commands that never reach you, so they always use a SAVED per-chat default -- \
+call set_timetable_label_format when the user asks to change how things are \
+labeled going forward (e.g. "use my nicknames on the timetable"), not just \
+query_schedule's one-off override.
+
 Categories (on tasks) and lesson types (on schedule blocks) are user-defined \
 labels that work like topic `kind`: before assigning a NEW one, call \
 list_task_categories / list_lesson_types and REUSE an existing label if one \
@@ -269,6 +304,7 @@ async def get_response(chat_id: int, user_text: str, history: list, job_queue) -
     system_prompt = build_system_prompt(chat_id)
 
     response = None
+    hit_ceiling = True
     for _ in range(MAX_TOOL_ITERATIONS):
         response = await _get_client().messages.create(
             model=MODEL,
@@ -280,6 +316,7 @@ async def get_response(chat_id: int, user_text: str, history: list, job_queue) -
         messages.append({"role": "assistant", "content": response.content})
 
         if response.stop_reason != "tool_use":
+            hit_ceiling = False
             break
 
         tool_results = []
@@ -297,8 +334,29 @@ async def get_response(chat_id: int, user_text: str, history: list, job_queue) -
                     }
                 )
         messages.append({"role": "user", "content": tool_results})
-    else:
-        logger.warning("Hit MAX_TOOL_ITERATIONS for chat %s", chat_id)
+
+    if hit_ceiling:
+        # Ran out of tool-call rounds (e.g. a combined calendar pulling
+        # lessons+tasks+notes+reminders across several queries). Rather than
+        # discard everything gathered so far, force ONE more call with no
+        # tools available -- Claude has to synthesize a real answer from
+        # whatever tool results already sit in `messages`, instead of the
+        # user getting a generic "something went wrong" for a request that
+        # mostly succeeded.
+        logger.warning(
+            "Hit MAX_TOOL_ITERATIONS for chat %s -- forcing a synthesis-only reply",
+            chat_id,
+        )
+        response = await _get_client().messages.create(
+            model=MODEL,
+            max_tokens=MAX_TOKENS,
+            system=system_prompt
+            + "\n\nYou are out of tool calls for this turn. Answer using ONLY "
+            "the tool results already gathered above -- do not claim to call "
+            "any more tools. If something is still missing, say so briefly "
+            "rather than guessing.",
+            messages=messages,
+        )
 
     final_text = next(
         (b.text for b in response.content if b.type == "text"), ""

@@ -238,8 +238,7 @@ async def pdf_import_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 continue
             try:
                 code = e.get("course_code")
-                module_name = (title_by_code.get(code) or code or "").strip()
-                if not module_name:
+                if not code:
                     failed.append(f"{label} — no course code")
                     continue
                 # Tree-wide, not root-scoped: once a module is filed under a
@@ -247,7 +246,9 @@ async def pdf_import_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 # and fork a second module topic -- whose new id then also fails
                 # find_matching_schedule_block below, duplicating every class on
                 # a re-import.
-                module = database.resolve_module_topic(chat_id, module_name)
+                module = database.resolve_module_topic(
+                    chat_id, code, full_name=title_by_code.get(code)
+                )
                 if database.find_matching_schedule_block(
                     chat_id,
                     module["id"],

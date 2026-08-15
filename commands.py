@@ -170,10 +170,12 @@ def build_events_detail_view(
 _MAX_SEMESTER_WEEK = 13
 
 
-def _class_row(occ: dict) -> str:
+def _class_row(occ: dict, label_format: str) -> str:
     """One indented class line: 'HH:MM Title - Location' (location dropped when
-    absent). Title is the module name plus class_type when set. Fully escaped."""
-    title_bits = [b for b in (occ.get("module_name"), occ.get("class_type")) if b]
+    absent). Title is the resolved module label plus class_type when set. Fully
+    escaped."""
+    label = database.resolve_label(occ, label_format)
+    title_bits = [b for b in (label, occ.get("class_type")) if b]
     title = " ".join(title_bits) or "Block"
     row = f"{occ['start_time']} {title}"
     if occ.get("location"):
@@ -189,6 +191,7 @@ def build_today_view(chat_id: int) -> str:
     tz = ZoneInfo(os.environ.get("TIMEZONE", "UTC"))
     today = datetime.now(tz).date()
     today_iso = today.isoformat()
+    label_format = database.get_timetable_label_format(chat_id)
 
     anchor = database.get_semester_anchor(chat_id)
     anchor_date = date.fromisoformat(anchor) if anchor else None
@@ -213,7 +216,7 @@ def build_today_view(chat_id: int) -> str:
             blocks, today_iso, today_iso, anchor_date, recess
         )
         if occ:
-            lines.extend(f"  {_class_row(o)}" for o in occ)
+            lines.extend(f"  {_class_row(o, label_format)}" for o in occ)
         else:
             lines.append("  No classes today")
     except scheduler.AnchorNotSetError:
@@ -247,6 +250,7 @@ def build_today_view(chat_id: int) -> str:
 def build_week_view(chat_id: int, week_number: int | None = None) -> str:
     tz = ZoneInfo(os.environ.get("TIMEZONE", "UTC"))
     today = datetime.now(tz).date()
+    label_format = database.get_timetable_label_format(chat_id)
     anchor = database.get_semester_anchor(chat_id)
     anchor_date = date.fromisoformat(anchor) if anchor else None
     recess = frozenset(database.get_recess_weeks(chat_id))
@@ -285,7 +289,7 @@ def build_week_view(chat_id: int, week_number: int | None = None) -> str:
         lines.append(d.strftime("%A %d %b"))
         day_occ = by_day.get(d.isoformat())
         if day_occ:
-            lines.extend(f"  {_class_row(o)}" for o in day_occ)
+            lines.extend(f"  {_class_row(o, label_format)}" for o in day_occ)
         else:
             lines.append("  — nothing")
 
@@ -497,6 +501,8 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def nav_button_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None or update.message.text is None:
+        return
     label = update.message.text
     if label == keyboards.TASKS_LABEL:
         await tasks_command(update, context)

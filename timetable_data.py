@@ -53,8 +53,9 @@ def _color(color_map: dict[str, str], module_name: str | None) -> str:
     return color_map.get(module_name) or _FALLBACK_COLOR
 
 
-def _title(occ: dict) -> str:
-    bits = [b for b in (occ.get("module_name"), occ.get("class_type")) if b]
+def _title(occ: dict, label_format: str) -> str:
+    label = database.resolve_label(occ, label_format)
+    bits = [b for b in (label, occ.get("class_type")) if b]
     return " ".join(bits) or "Block"
 
 
@@ -89,13 +90,14 @@ def build_daily_context(chat_id: int, target_date: date) -> dict:
     anchor_date = _anchor_date(chat_id)
     recess = _recess_weeks(chat_id)
     color_map = _color_map(chat_id)
+    label_format = database.get_timetable_label_format(chat_id)
 
     blocks = database.list_schedule_blocks(chat_id=chat_id, date_from=iso, date_to=iso)
     occ = scheduler.expand_occurrences(blocks, iso, iso, anchor_date, recess)
     slots = [
         {
             "start_time": o["start_time"],
-            "title": _title(o),
+            "title": _title(o, label_format),
             "location": o.get("location"),
             "time_range": _time_range(o),
             "color": _color(color_map, o.get("module_name")),
@@ -142,6 +144,7 @@ def build_weekly_context(chat_id: int, week_number: int | None = None) -> dict:
     anchor_date = _anchor_date(chat_id)
     recess = _recess_weeks(chat_id)
     color_map = _color_map(chat_id)
+    label_format = database.get_timetable_label_format(chat_id)
 
     monday, sunday, wk_label = scheduler.resolve_week_range(
         anchor_date, today, week_number, recess
@@ -169,7 +172,7 @@ def build_weekly_context(chat_id: int, week_number: int | None = None) -> dict:
             {
                 "time_range": _time_range(o),
                 "color": _color(color_map, o.get("module_name")),
-                "title": _title(o),
+                "title": _title(o, label_format),
                 "location": o.get("location"),
             }
             for o in by_day.get(d.isoformat(), [])
@@ -193,6 +196,7 @@ def build_monthly_context(chat_id: int, year: int, month: int) -> dict:
     anchor_date = _anchor_date(chat_id)
     recess = _recess_weeks(chat_id)
     color_map = _color_map(chat_id)
+    label_format = database.get_timetable_label_format(chat_id)
 
     first = date(year, month, 1)
     last_dom = calendar.monthrange(year, month)[1]
@@ -208,15 +212,18 @@ def build_monthly_context(chat_id: int, year: int, month: int) -> dict:
         recess,
     )
     marks_by_day: dict[str, list[dict]] = {}
-    modules_seen: dict[str, str] = {}  # only modules that appear this month
+    # Keyed by the raw code (never ambiguous, unlike a nickname two modules
+    # could theoretically share) -- the DISPLAYED label is resolved separately
+    # below, only when building the legend.
+    modules_seen: dict[str, str] = {}  # code -> color, only modules seen this month
     for o in occ:
-        color = _color(color_map, o.get("module_name"))
+        code = o.get("module_name")
+        color = _color(color_map, code)
         marks_by_day.setdefault(o["occurrence_date"], []).append(
             {"shape": _marker_shape(o.get("class_type")), "color": color}
         )
-        name = o.get("module_name")
-        if name and name not in modules_seen:
-            modules_seen[name] = color
+        if code and code not in modules_seen:
+            modules_seen[code] = color
 
     start_utc, end_utc = _day_bounds_utc(tz, first, last)
     deadline_days: set[date] = set()
@@ -250,9 +257,15 @@ def build_monthly_context(chat_id: int, year: int, month: int) -> dict:
     while len(cells) % 7 != 0:  # trailing blanks to complete the last row
         cells.append({"is_blank": True})
 
+    module_rows = {
+        m["name"]: m for m in database.list_topics(chat_id, kind="module")
+    }
     legend_modules = [
-        {"name": name, "color": color}
-        for name, color in sorted(modules_seen.items())
+        {
+            "name": database.resolve_label(module_rows.get(code, {"name": code}), label_format),
+            "color": color,
+        }
+        for code, color in sorted(modules_seen.items())
     ]
 
     return {
