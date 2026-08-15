@@ -15,6 +15,7 @@ from telegram.ext import ContextTypes
 import commands
 import database
 import keyboards
+import pdf_import
 import scheduler
 
 logger = logging.getLogger(__name__)
@@ -204,9 +205,14 @@ async def pdf_import_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         action = parts[1]
         import_id = parts[2]
 
-        # pop() -- confirming or cancelling consumes the stash so a double-tap
-        # can't import twice.
-        result = context.chat_data.get("pending_pdf_import", {}).pop(import_id, None)
+        # Only confirm/cancel consume the stash (pop) -- every other action
+        # (list/edit/field/delete/rootpick) is a mid-flow navigation step that
+        # must leave the pending import in place for the NEXT tap.
+        if action in ("confirm", "cancel"):
+            result = context.chat_data.get("pending_pdf_import", {}).pop(import_id, None)
+        else:
+            result = context.chat_data.get("pending_pdf_import", {}).get(import_id)
+
         if result is None:
             await query.edit_message_text(
                 "This import has expired or was already handled. Re-upload the PDF to try again."
@@ -215,7 +221,81 @@ async def pdf_import_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
         if action == "cancel":
+            context.chat_data.pop("pdf_import_awaiting", None)
             await query.edit_message_text("Import cancelled — nothing was saved.")
+            await query.answer()
+            return
+
+        if action == "rootpick":
+            topic_id = int(parts[3])
+            topic = database.get_topic(chat_id, topic_id)
+            if topic is None:
+                await query.edit_message_text("That topic no longer exists.")
+                await query.answer()
+                return
+            topics = database.list_topics(chat_id)
+            path = next((t["path"] for t in topics if t["id"] == topic_id), topic["name"])
+            result["target_parent_topic_id"] = topic_id
+            result["target_parent_path"] = path
+            context.chat_data.pop("pdf_import_awaiting", None)
+            note = result.pop("_page_note", "")
+            await query.edit_message_text(
+                pdf_import.build_import_preview(result) + note,
+                parse_mode="HTML",
+                reply_markup=keyboards.pdf_import_entry_list_keyboard(import_id, result["schedule_entries"]),
+            )
+            await query.answer()
+            return
+
+        if action == "list":
+            note = result.pop("_page_note", "")
+            await query.edit_message_text(
+                pdf_import.build_import_preview(result) + note,
+                parse_mode="HTML",
+                reply_markup=keyboards.pdf_import_entry_list_keyboard(import_id, result["schedule_entries"]),
+            )
+            await query.answer()
+            return
+
+        if action == "edit":
+            entry_idx = int(parts[3])
+            entry = next((e for e in result["schedule_entries"] if e.get("_idx") == entry_idx), None)
+            if entry is None:
+                await query.edit_message_text("That entry no longer exists.")
+                await query.answer()
+                return
+            await query.edit_message_text(
+                f"Editing entry #{entry_idx}: {pdf_import._entry_row(entry)}\n\nChoose a field to edit:",
+                parse_mode="HTML",
+                reply_markup=keyboards.pdf_import_entry_edit_keyboard(import_id, entry_idx),
+            )
+            await query.answer()
+            return
+
+        if action == "field":
+            entry_idx = int(parts[3])
+            field = parts[4]
+            label, _ = pdf_import.EDITABLE_FIELDS[field]
+            context.chat_data["pdf_import_awaiting"] = {
+                "kind": "field", "import_id": import_id,
+                "entry_idx": entry_idx, "field": field,
+            }
+            await query.answer()
+            await query.message.reply_text(f"Reply with the new {label.lower()}.")
+            return
+
+        if action == "delete":
+            entry_idx = int(parts[3])
+            result["schedule_entries"] = [
+                e for e in result["schedule_entries"] if e.get("_idx") != entry_idx
+            ]
+            pdf_import._renumber(result["schedule_entries"])
+            note = result.pop("_page_note", "")
+            await query.edit_message_text(
+                pdf_import.build_import_preview(result) + note,
+                parse_mode="HTML",
+                reply_markup=keyboards.pdf_import_entry_list_keyboard(import_id, result["schedule_entries"]),
+            )
             await query.answer()
             return
 
@@ -225,6 +305,7 @@ async def pdf_import_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             for c in result["courses"]
             if c.get("course_code")
         }
+        target_parent_topic_id = result.get("target_parent_topic_id")
         created = 0
         skipped = 0
         failed: list[str] = []
@@ -245,9 +326,13 @@ async def pdf_import_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 # semester topic, get_or_create_topic(parent=None) would miss it
                 # and fork a second module topic -- whose new id then also fails
                 # find_matching_schedule_block below, duplicating every class on
-                # a re-import.
+                # a re-import. target_parent_topic_id only affects a GENUINELY
+                # NEW module (see resolve_module_topic's docstring) -- one that
+                # already exists elsewhere in the tree is reused as-is, never
+                # moved by an import.
                 module = database.resolve_module_topic(
-                    chat_id, code, full_name=title_by_code.get(code)
+                    chat_id, code, full_name=title_by_code.get(code),
+                    parent_topic_id=target_parent_topic_id,
                 )
                 if database.find_matching_schedule_block(
                     chat_id,

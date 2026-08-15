@@ -25,6 +25,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 import brain
+import database
 import keyboards
 
 logger = logging.getLogger(__name__)
@@ -260,6 +261,17 @@ def normalize_class_type(raw: str | None) -> str | None:
     return CLASS_TYPE_MAP.get(key, raw.strip())
 
 
+def _renumber(entries: list[dict]) -> None:
+    """Assign each entry a stable 1-based _idx matching its current list
+    position. Called after every mutation (edit/delete) so the keyboard,
+    which is always fully rebuilt from the current list right after any
+    change, and the numbers shown in the preview text never drift apart --
+    there's never a window where a button references a number the text
+    doesn't also show."""
+    for i, e in enumerate(entries, start=1):
+        e["_idx"] = i
+
+
 def _merge_pages(pages: list[dict]) -> dict:
     """Concatenate courses + schedule_entries across pages and resolve each
     entry's week_pattern. Entries whose printed label can't be parsed are marked
@@ -275,7 +287,57 @@ def _merge_pages(pages: list[dict]) -> dict:
         except ValueError:
             e["needs_review"] = True
         e["class_type"] = normalize_class_type(e.get("class_type"))
-    return {"courses": courses, "schedule_entries": entries}
+    _renumber(entries)
+    return {"courses": courses, "schedule_entries": entries, "target_parent_topic_id": None, "target_parent_path": None}
+
+
+# --- editable-field validation (mirrors normalize_week_label's philosophy:
+# deterministic, in Python, raises rather than silently accepting garbage) --
+
+_TIME_EDIT_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
+
+def validate_time(raw: str) -> str:
+    s = raw.strip()
+    if not _TIME_EDIT_RE.match(s):
+        raise ValueError(f"'{raw}' isn't a 24-hour HH:MM time, e.g. 14:00")
+    return s
+
+
+def validate_day(raw: str) -> str:
+    s = raw.strip().upper()
+    if s in _DAY_ORDER:
+        return s
+    # accept a full name too ("Monday" -> "MON")
+    for code, name in _DAY_NAMES.items():
+        if s == name.upper():
+            return code
+    raise ValueError(f"'{raw}' isn't a recognized day (Mon-Sun)")
+
+
+EDITABLE_FIELDS = {
+    "day_of_week": ("Day", validate_day),
+    "start_time": ("Start time", validate_time),
+    "end_time": ("End time", validate_time),
+    "location": ("Location", lambda s: s.strip() or None),
+    "class_type": ("Type", lambda s: normalize_class_type(s.strip()) or None),
+}
+
+
+# --- import-root resolution (the "which topic do these go under" step) ----
+
+def match_topics_by_name(chat_id: int, text: str) -> list[dict]:
+    """Exact, case-insensitive match against every topic's own name. Returns
+    every match (there can be more than one -- topic names aren't globally
+    unique across different parents) so the caller can disambiguate rather
+    than guess. Deliberately does NOT do the "Y3S1" shorthand-decomposition
+    trick brain.py's prompt uses -- that's a judgment call suited to an LLM
+    reasoning over ambiguity, not a deterministic matcher backing a Telegram
+    button flow where precision matters (this determines where a whole
+    semester's worth of modules land).
+    """
+    s = text.strip().casefold()
+    return [t for t in database.list_topics(chat_id) if t["name"].strip().casefold() == s]
 
 
 # --- preview rendering (mirrors build_week_view's day/row style) -----------
@@ -283,7 +345,7 @@ def _merge_pages(pages: list[dict]) -> dict:
 def _entry_row(e: dict) -> str:
     title_bits = [b for b in (e.get("course_code"), e.get("class_type")) if b]
     title = " ".join(title_bits) or "Class"
-    row = f"{e.get('start_time', '?')}-{e.get('end_time', '?')} {title}"
+    row = f"#{e.get('_idx', '?')} {e.get('start_time', '?')}-{e.get('end_time', '?')} {title}"
     if e.get("location"):
         row += f" - {e['location']}"
     if e.get("needs_review"):
@@ -303,7 +365,9 @@ def build_import_preview(result: dict) -> str:
     registered = sum(1 for c in courses if _status_is(c, "reg"))
     waitlisted = sum(1 for c in courses if _status_is(c, "wait"))
 
+    root_line = f"Importing under: {result.get('target_parent_path') or 'Top level'}"
     lines = [
+        root_line,
         f"{len(courses)} courses found — {registered} registered, {waitlisted} waitlisted",
         f"{len(entries)} weekly class blocks found",
         "",
@@ -371,19 +435,106 @@ async def handle_pdf_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             )
             return
 
-        import_id = secrets.token_hex(4)
-        context.chat_data.setdefault("pending_pdf_import", {})[import_id] = result
-
-        note = ""
         if total_pages > MAX_PAGES:
-            note = (
+            result["_page_note"] = (
                 f"\n\n(Note: the PDF had {total_pages} pages; I only read the "
                 f"first {MAX_PAGES}.)"
             )
+
+        import_id = secrets.token_hex(4)
+        context.chat_data.setdefault("pending_pdf_import", {})[import_id] = result
+
+        # Ask where these modules should go BEFORE showing the preview, per
+        # the user's explicit preference -- this is a plain text reply (not a
+        # tool call), intercepted by bot.py's message_handler via the
+        # 'pdf_import_awaiting' chat_data flag, since the AI tool loop can't
+        # reach context.chat_data (see match_topics_by_name's docstring for
+        # why this step is a deterministic Python matcher, not an LLM call).
+        context.chat_data["pdf_import_awaiting"] = {"kind": "root", "import_id": import_id}
         await update.message.reply_text(
-            build_import_preview(result) + note,
-            parse_mode="HTML",
-            reply_markup=keyboards.pdf_import_confirm_keyboard(import_id),
+            "Where should these modules go? Reply with an existing topic's "
+            "name (e.g. \"Semester 1\"), or \"root\" for the top level."
         )
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+async def handle_pdf_import_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Intercepts a plain-text reply while a PDF import is awaiting either a
+    root-topic answer or an edited field value. Returns True if it consumed
+    the message (caller should NOT also route it to brain.get_response),
+    False if there's nothing pending (caller proceeds normally).
+    """
+    import database
+
+    awaiting = context.chat_data.get("pdf_import_awaiting")
+    if not awaiting:
+        return False
+
+    chat_id = update.effective_chat.id
+    text = (update.message.text or "").strip()
+    import_id = awaiting["import_id"]
+    result = context.chat_data.get("pending_pdf_import", {}).get(import_id)
+    if result is None:
+        context.chat_data.pop("pdf_import_awaiting", None)
+        await update.message.reply_text(
+            "This import has expired. Re-upload the PDF to try again."
+        )
+        return True
+
+    if awaiting["kind"] == "root":
+        if text.lower() in ("root", "top", "top level", "none"):
+            result["target_parent_topic_id"] = None
+            result["target_parent_path"] = "Top level"
+        else:
+            matches = match_topics_by_name(chat_id, text)
+            if not matches:
+                await update.message.reply_text(
+                    f"No topic found named '{text}'. Try again, or reply \"root\" "
+                    "for the top level."
+                )
+                return True
+            if len(matches) > 1:
+                context.chat_data["pdf_import_awaiting"] = {
+                    "kind": "root_pick", "import_id": import_id,
+                }
+                await update.message.reply_text(
+                    f"{len(matches)} topics are named '{text}' — which one?",
+                    reply_markup=keyboards.pdf_import_root_pick_keyboard(import_id, matches),
+                )
+                return True
+            result["target_parent_topic_id"] = matches[0]["id"]
+            result["target_parent_path"] = matches[0]["path"]
+
+        context.chat_data.pop("pdf_import_awaiting", None)
+        note = result.pop("_page_note", "")
+        await update.message.reply_text(
+            build_import_preview(result) + note,
+            parse_mode="HTML",
+            reply_markup=keyboards.pdf_import_entry_list_keyboard(import_id, result["schedule_entries"]),
+        )
+        return True
+
+    if awaiting["kind"] == "field":
+        entry_idx = awaiting["entry_idx"]
+        field = awaiting["field"]
+        label, validator = EDITABLE_FIELDS[field]
+        entries = result["schedule_entries"]
+        entry = next((e for e in entries if e.get("_idx") == entry_idx), None)
+        if entry is None:
+            context.chat_data.pop("pdf_import_awaiting", None)
+            await update.message.reply_text("That entry no longer exists.")
+            return True
+        try:
+            entry[field] = validator(text)
+        except ValueError as exc:
+            await update.message.reply_text(f"{exc} — try again.")
+            return True
+        context.chat_data.pop("pdf_import_awaiting", None)
+        await update.message.reply_text(
+            f"Updated {label.lower()} to '{entry[field]}'.",
+            reply_markup=keyboards.pdf_import_entry_edit_keyboard(import_id, entry_idx),
+        )
+        return True
+
+    return False

@@ -95,6 +95,15 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # Silently ignore rather than respond to an edit as if it were new.
         return
 
+    # A pending "where should this import go" / "new value for this field"
+    # question takes priority over everything else -- these are plain text
+    # replies to a prompt WE issued, not a general request for Claude, and
+    # context.chat_data (where the pending import lives) isn't reachable from
+    # the AI tool loop at all (see pdf_import.match_topics_by_name's
+    # docstring). Consumed here means it never reaches brain.get_response.
+    if await pdf_import.handle_pdf_import_reply(update, context):
+        return
+
     chat_id = update.effective_chat.id
     user_text = update.message.text
     history = context.chat_data.setdefault("history", [])
@@ -171,8 +180,6 @@ def main() -> None:
 
     logger.info("Starting Kangani...")
     application.run_polling()
-
-#done
 
 
 if __name__ == "__main__":

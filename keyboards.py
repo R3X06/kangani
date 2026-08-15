@@ -174,6 +174,53 @@ def pdf_import_confirm_keyboard(import_id: str) -> InlineKeyboardMarkup:
     )
 
 
+def pdf_import_root_pick_keyboard(import_id: str, candidates: list[dict]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(t["path"], callback_data=f"pdfimport:rootpick:{import_id}:{t['id']}")]
+        for t in candidates
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def pdf_import_entry_list_keyboard(
+    import_id: str, entries: list[dict]
+) -> InlineKeyboardMarkup:
+    # Two "Edit #N" buttons per row keeps a full semester's ~15 entries from
+    # becoming an unreasonably tall keyboard.
+    edit_buttons = [
+        InlineKeyboardButton(
+            f"✏️ #{e['_idx']}", callback_data=f"pdfimport:edit:{import_id}:{e['_idx']}"
+        )
+        for e in entries
+    ]
+    rows = [edit_buttons[i:i + 2] for i in range(0, len(edit_buttons), 2)]
+    rows.append(
+        [
+            InlineKeyboardButton("✅ Import", callback_data=f"pdfimport:confirm:{import_id}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"pdfimport:cancel:{import_id}"),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def pdf_import_entry_edit_keyboard(import_id: str, entry_idx: int) -> InlineKeyboardMarkup:
+    field_labels = [
+        ("day_of_week", "Day"), ("start_time", "Start"), ("end_time", "End"),
+        ("location", "Location"), ("class_type", "Type"),
+    ]
+    rows = [
+        [InlineKeyboardButton(label, callback_data=f"pdfimport:field:{import_id}:{entry_idx}:{field}")]
+        for field, label in field_labels
+    ]
+    rows.append(
+        [InlineKeyboardButton("🗑 Delete entry", callback_data=f"pdfimport:delete:{import_id}:{entry_idx}")]
+    )
+    rows.append(
+        [InlineKeyboardButton("⬅️ Back to list", callback_data=f"pdfimport:list:{import_id}")]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
 def event_list_keyboard(events: list[dict]) -> InlineKeyboardMarkup:
     # "events" are now topics with an event_datetime -- keyed by topic id.
     rows = [

@@ -1168,7 +1168,10 @@ def set_topic_event_datetime(chat_id: int, topic_id: int, event_datetime: str) -
 
 
 def resolve_module_topic(
-    chat_id: int, module_name: str, full_name: str | None = None
+    chat_id: int,
+    module_name: str,
+    full_name: str | None = None,
+    parent_topic_id: int | None = None,
 ) -> dict:
     """Find (or create) the kind='module' topic named `module_name`, ANYWHERE
     in the tree -- not just at the root.
@@ -1184,6 +1187,12 @@ def resolve_module_topic(
     full_name is filled in (never overwritten) on whichever match is found --
     this is how re-importing a schedule PDF backfills the official course
     title onto a module you already created and nested by hand.
+
+    parent_topic_id ONLY affects where a genuinely NEW module gets created --
+    an existing module found anywhere else in the tree is always reused as-is
+    (never moved), so this can't fork a duplicate under the new parent. This
+    is what lets a PDF import target "under S1" without re-creating a module
+    you already have nested somewhere else.
 
     Raises on ambiguity rather than picking: two same-named module topics is
     already a broken state, and silently guessing one is how the timetable
@@ -1204,7 +1213,10 @@ def resolve_module_topic(
         if full_name and not matches[0].get("full_name"):
             return set_topic_names(chat_id, matches[0]["id"], full_name=full_name)
         return matches[0]
-    return get_or_create_topic(chat_id, module_name, kind="module", full_name=full_name)
+    return get_or_create_topic(
+        chat_id, module_name, kind="module", full_name=full_name,
+        parent_topic_id=parent_topic_id,
+    )
 
 
 def get_topic(chat_id: int, topic_id: int) -> dict | None:
