@@ -1094,7 +1094,16 @@ def _handle_list_topics(tool_input: dict, chat_id: int, job_queue) -> str:
     lines = []
     for t in topics:
         kind_part = f" [{t['kind']}]" if t["kind"] else ""
-        lines.append(f"#{t['id']}{kind_part} {t['path']}")
+        # Show nickname/full_name so scope-shorthand resolution (e.g. "Y1S1"
+        # -> S1 under Y1) can match against a topic's nickname, not just its
+        # name -- otherwise Claude can't see that "Year 1" is nicknamed "Y1".
+        extra = []
+        if t.get("nickname"):
+            extra.append(f"nickname: {t['nickname']}")
+        if t.get("full_name"):
+            extra.append(f"full name: {t['full_name']}")
+        extra_part = f" ({'; '.join(extra)})" if extra else ""
+        lines.append(f"#{t['id']}{kind_part} {t['path']}{extra_part}")
     return "\n".join(lines)
 
 

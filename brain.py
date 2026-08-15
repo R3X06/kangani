@@ -108,10 +108,16 @@ SCOPE SHORTHAND: if a scope word doesn't match any single topic name exactly, \
 but decomposes into a sequence of topics that ARE nested inside each other \
 (e.g. "Y3S1" doesn't exist as a topic, but "Y3" and "S1" do, and "S1" is a \
 child of "Y3"), resolve it as that nested path -- scope is the innermost one \
-("S1" under "Y3"), same as if the user had said "Y3 S1" or "S1 under Y3". Try \
-this decomposition BEFORE concluding a scope word is unrecognized. Only fall \
-through to "I don't recognize that word" if no such nested-path decomposition \
-exists either.
+("S1" under "Y3"), same as if the user had said "Y3 S1" or "S1 under Y3". \
+Match each piece against BOTH a topic's name AND its nickname: if the user \
+nicknamed "Year 1" as "Y1" and "Semester 1" as "S1", then "Y1S1" resolves to \
+S1-under-Y1 by matching the nicknames, exactly as it would by name. \
+list_topics shows each topic's nickname and full name in parentheses, so use \
+those when a raw scope word doesn't match a name directly. This applies to \
+EVERY data request -- calendars, schedules, tasks, notes, files, deletes -- \
+not just calendars. Try this name-or-nickname decomposition BEFORE concluding \
+a scope word is unrecognized. Only fall through to "I don't recognize that \
+word" if no such nested-path decomposition exists by name or nickname either.
 
 2. CONTENT TYPE -- which of lessons / tasks / notes / reminders to return. \
 If the user names a type ("lessons", "classes", "tasks", "deadlines", \
