@@ -172,6 +172,8 @@ def main() -> None:
     logger.info("Starting Kangani...")
     application.run_polling()
 
+#done
+
 
 if __name__ == "__main__":
     main()
