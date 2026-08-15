@@ -36,10 +36,14 @@ EXTRACTION_MODEL = "claude-sonnet-5"
 
 # NTU timetable class-type codes -> the class_type labels Kangani stores. The
 # vision prompt is told to use the PDF's own legend where present and fall back
-# to this map otherwise.
+# to this map otherwise. normalize_class_type() also applies this map as a
+# Python-side safety net (see there) -- LEC/STU is the literal compound code
+# NTU prints (not two separate LEC and STU entries), so it needs its own key
+# rather than relying on the model to split it.
 CLASS_TYPE_MAP = {
     "LEC": "Lecture",
     "STU": "Lecture",   # "studio" lecture-style slot
+    "LEC/STU": "Lecture",
     "TUT": "Tutorial",
     "LAB": "Lab",
     "SEM": "Seminar",
@@ -233,6 +237,29 @@ async def _extract_page(image) -> dict:
     }
 
 
+def normalize_class_type(raw: str | None) -> str | None:
+    """Normalize a printed class-type code to Kangani's stored label, the same
+    way normalize_week_label handles week ranges: deterministic, in Python,
+    not fully trusted to the vision model.
+
+    Unlike week labels, this does NOT raise on an unrecognized value -- a
+    user's timetable can genuinely have a class type outside NTU's standard
+    codes (SEM, DES, PRJ...), and rejecting those would flag every one of
+    them for manual review for no reason. So: known codes (case/slash/space
+    insensitive, e.g. "lec", "LEC/STU", "Lec / Stu") get mapped to their
+    canonical label via CLASS_TYPE_MAP; anything else passes through
+    unchanged (the vision model's own transcription, trusted as a fallback
+    rather than discarded).
+    """
+    if not raw:
+        return raw
+    # "LEC/STU" or "Lec / Stu" -> "LEC/STU"; strips spaces around the slash
+    # and any internal whitespace, then matches CLASS_TYPE_MAP case-insensitively.
+    key = re.sub(r"\s*/\s*", "/", raw.strip()).upper()
+    key = re.sub(r"\s+", "", key)
+    return CLASS_TYPE_MAP.get(key, raw.strip())
+
+
 def _merge_pages(pages: list[dict]) -> dict:
     """Concatenate courses + schedule_entries across pages and resolve each
     entry's week_pattern. Entries whose printed label can't be parsed are marked
@@ -247,6 +274,7 @@ def _merge_pages(pages: list[dict]) -> dict:
             e["week_pattern"] = normalize_week_label(e.get("week_label_raw"))
         except ValueError:
             e["needs_review"] = True
+        e["class_type"] = normalize_class_type(e.get("class_type"))
     return {"courses": courses, "schedule_entries": entries}
 
 
