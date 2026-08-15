@@ -264,7 +264,7 @@ async def pdf_import_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                     start_time=e.get("start_time"),
                     end_time=e.get("end_time"),
                     day_of_week=e.get("day_of_week"),
-                    module_name=module_name,
+                    module_name=code,
                     class_type=e.get("class_type"),
                     location=e.get("location"),
                     week_pattern=e.get("week_pattern", "every"),
