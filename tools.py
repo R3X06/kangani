@@ -560,6 +560,81 @@ TOOL_SCHEMAS = [
         },
     },
     {
+        "name": "query_files",
+        "description": (
+            "Retrieve stored files and SEND them back to the user. Files are "
+            "documents/photos the user uploaded and filed under a topic (a "
+            "personal cloud). With a topic_id, returns files under that topic "
+            "AND everything nested beneath it (its subtree) by default -- so "
+            "'bring me the study notes files' resolves the 'Study Notes' topic "
+            "and sends every file under it. With no topic_id, lists across all "
+            "topics. Resolve the topic_id via list_topics first (matching name "
+            "or nickname). Calling this both lists the files in your reply AND "
+            "re-sends the actual files to the chat."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "topic_id": {
+                    "type": "integer",
+                    "description": (
+                        "Restrict to files under this topic and its subtree. "
+                        "Look it up via list_topics."
+                    ),
+                },
+                "include_subtopics": {
+                    "type": "boolean",
+                    "description": "Default true. false = exact topic only.",
+                },
+                "send": {
+                    "type": "boolean",
+                    "description": (
+                        "Default true -- actually re-send the files to the "
+                        "chat. Set false to only LIST them (name/nickname) "
+                        "without sending, e.g. 'what files do I have under X'."
+                    ),
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "set_file_nickname",
+        "description": (
+            "Give a stored file a nickname so the user can refer to it later. "
+            "Look up the file's id via query_files (send=false) first."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_id": {
+                    "type": "integer",
+                    "description": "The file's row id (from query_files), NOT a Telegram id.",
+                },
+                "nickname": {"type": "string"},
+            },
+            "required": ["file_id", "nickname"],
+        },
+    },
+    {
+        "name": "delete_file",
+        "description": (
+            "Remove a stored file from Kangani (the copy on Telegram's servers "
+            "is unaffected; this just forgets the reference). Look up the "
+            "file's id via query_files first."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_id": {
+                    "type": "integer",
+                    "description": "The file's row id (from query_files).",
+                },
+            },
+            "required": ["file_id"],
+        },
+    },
+    {
         "name": "create_schedule_block",
         "description": (
             "Create a recurring weekly block (day_of_week) or a one-off "
@@ -1147,6 +1222,57 @@ def _handle_query_notes(tool_input: dict, chat_id: int, job_queue) -> str:
 _MAX_SCHEDULE_QUERY_DAYS = 90
 
 
+async def _send_files_job(context) -> None:
+    """JobQueue callback: re-send the files gathered by _handle_query_files.
+    Runs on the bot's event loop with access to context.bot, which the
+    synchronous tool handler doesn't have -- so the handler schedules this to
+    fire immediately rather than sending inline."""
+    import file_storage
+    data = context.job.data
+    await file_storage.send_files(context, data["chat_id"], data["files"])
+
+
+def _handle_query_files(tool_input: dict, chat_id: int, job_queue) -> str:
+    files = database.list_files(
+        chat_id=chat_id,
+        topic_id=tool_input.get("topic_id"),
+        include_subtopics=tool_input.get("include_subtopics", True),
+    )
+    if not files:
+        return "No files match that. Upload one by sending it to me."
+    send = tool_input.get("send", True)
+    if send:
+        # Schedule the actual re-send to run immediately on the bot loop, where
+        # context.bot exists (a sync tool handler can't await send_document).
+        job_queue.run_once(
+            _send_files_job, when=0,
+            data={"chat_id": chat_id, "files": files},
+            name=f"sendfiles-{chat_id}",
+        )
+    label = "Sending" if send else "Found"
+    lines = [f"{label} {len(files)} file(s):"]
+    for f in files:
+        name = f.get("nickname") or f.get("file_name") or "file"
+        where = f" [{f['topic_name']}]" if f.get("topic_name") else " [unfiled]"
+        lines.append(f"#{f['id']} {name}{where}")
+    return "\n".join(lines)
+
+
+def _handle_set_file_nickname(tool_input: dict, chat_id: int, job_queue) -> str:
+    row = database.set_file_nickname(chat_id, tool_input["file_id"], tool_input["nickname"])
+    if row is None:
+        return f"No file #{tool_input['file_id']} found."
+    return f"File #{row['id']} nicknamed '{row['nickname']}'."
+
+
+def _handle_delete_file(tool_input: dict, chat_id: int, job_queue) -> str:
+    ok = database.delete_file(chat_id, tool_input["file_id"])
+    return (
+        f"Removed file #{tool_input['file_id']} from Kangani."
+        if ok else f"No file #{tool_input['file_id']} found."
+    )
+
+
 def _handle_create_schedule_block(tool_input: dict, chat_id: int, job_queue) -> str:
     block = database.create_schedule_block(
         chat_id=chat_id,
@@ -1284,6 +1410,9 @@ TOOL_HANDLERS: dict[str, Callable[[dict, int, object], str]] = {
     "list_topics": _handle_list_topics,
     "add_note": _handle_add_note,
     "query_notes": _handle_query_notes,
+    "query_files": _handle_query_files,
+    "set_file_nickname": _handle_set_file_nickname,
+    "delete_file": _handle_delete_file,
     "create_schedule_block": _handle_create_schedule_block,
     "query_schedule": _handle_query_schedule,
     "delete_schedule_block": _handle_delete_schedule_block,

@@ -19,6 +19,7 @@ import brain
 import callbacks
 import commands
 import database
+import file_storage
 import keyboards
 import pdf_import
 import scheduler
@@ -104,6 +105,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if await pdf_import.handle_pdf_import_reply(update, context):
         return
 
+    # Same pattern: a reply naming which topic an uploaded file goes under is
+    # a plain-text answer to OUR prompt, consumed here before brain sees it.
+    if await file_storage.handle_file_upload_reply(update, context):
+        return
+
     chat_id = update.effective_chat.id
     user_text = update.message.text
     history = context.chat_data.setdefault("history", [])
@@ -163,6 +169,15 @@ def main() -> None:
     # PDF uploads (schedule import) -- registered before the catch-all text
     # handler so a document upload is routed here, not into brain.get_response().
     application.add_handler(MessageHandler(filters.Document.PDF, pdf_import.handle_pdf_upload))
+    # Non-PDF documents, photos, videos, audio -> general file storage. PDFs
+    # are caught by the timetable handler above; this catches everything else.
+    application.add_handler(
+        MessageHandler(
+            (filters.Document.ALL & ~filters.Document.PDF)
+            | filters.PHOTO | filters.VIDEO | filters.AUDIO,
+            file_storage.handle_file_upload,
+        )
+    )
 
     # Nav-button presses arrive as plain text -- this handler is registered
     # BEFORE the catch-all so PTB routes matching button labels here first,
