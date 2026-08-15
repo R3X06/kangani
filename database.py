@@ -133,6 +133,20 @@ CREATE TABLE IF NOT EXISTS chat_settings (
     semester_week1_start_date TEXT,
     timetable_label_format    TEXT NOT NULL DEFAULT 'code'
 );
+
+CREATE TABLE IF NOT EXISTS files (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id       INTEGER NOT NULL,
+    topic_id      INTEGER REFERENCES topics(id) ON DELETE CASCADE,
+    tag           TEXT,
+    file_id       TEXT NOT NULL,
+    file_unique_id TEXT,
+    file_name     TEXT,
+    nickname      TEXT,
+    mime_type     TEXT,
+    file_size     INTEGER,
+    uploaded_at   TEXT NOT NULL DEFAULT (STRFTIME('%Y-%m-%dT%H:%M:%fZ','now'))
+);
 """
 
 # Created after the schema is in its final shape (post-migration), so every
@@ -147,6 +161,8 @@ CREATE INDEX IF NOT EXISTS idx_notes_topic           ON notes(topic_id);
 CREATE INDEX IF NOT EXISTS idx_progress_logs_topic   ON progress_logs(topic_id);
 CREATE INDEX IF NOT EXISTS idx_schedule_blocks_chat  ON schedule_blocks(chat_id);
 CREATE INDEX IF NOT EXISTS idx_reminders_chat_status ON reminders(chat_id, status);
+CREATE INDEX IF NOT EXISTS idx_files_chat            ON files(chat_id);
+CREATE INDEX IF NOT EXISTS idx_files_topic           ON files(topic_id);
 """
 
 # The topic-uniqueness guarantee, as an INDEX rather than a table constraint:
@@ -166,7 +182,7 @@ _SCHEMA_VERSION = 2
 # brand-new/empty DB (version < _SCHEMA_VERSION). 'modules'/'events' stay listed
 # so a stale pre-migration fresh DB still gets them dropped harmlessly.
 _ALL_TABLES = [
-    "reminders", "progress_logs", "notes", "schedule_blocks",
+    "files", "reminders", "progress_logs", "notes", "schedule_blocks",
     "tasks", "topics", "events", "modules", "chat_settings",
 ]
 
@@ -492,7 +508,7 @@ def _migrate_notes_general(conn: sqlite3.Connection) -> None:
 # item never causes another's tag to change or be reassigned. Deliberately
 # NOT the id: an id reveals creation order and total count; a tag doesn't,
 # and stays hidden from normal listings unless the user asks for it.
-_TAG_TABLES = ("notes", "tasks", "reminders")
+_TAG_TABLES = ("notes", "tasks", "reminders", "files")
 
 
 def _new_tag(conn: sqlite3.Connection, table: str) -> str:
@@ -667,6 +683,220 @@ def get_topic_subtree_ids(conn: sqlite3.Connection, chat_id: int, topic_id: int)
         frontier = [r["id"] for r in children]
         ids.extend(frontier)
     return ids
+
+
+# --- files: Telegram-backed per-topic storage --------------------------------
+# We store only Telegram's file_id (a durable handle to bytes living on
+# Telegram's servers) plus metadata; retrieval re-sends the file_id and
+# Telegram serves the bytes. Caveat: a file_id is only valid for THIS bot
+# token -- migrating tokens would orphan every stored file.
+
+def create_file(
+    chat_id: int,
+    file_id: str,
+    topic_id: int | None = None,
+    file_unique_id: str | None = None,
+    file_name: str | None = None,
+    nickname: str | None = None,
+    mime_type: str | None = None,
+    file_size: int | None = None,
+) -> dict:
+    conn = get_connection()
+    try:
+        if topic_id is not None:
+            _require_topic(conn, chat_id, topic_id)
+        tag = _new_tag(conn, "files")
+        cur = conn.execute(
+            "INSERT INTO files (chat_id, topic_id, tag, file_id, file_unique_id, "
+            "file_name, nickname, mime_type, file_size) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (chat_id, topic_id, tag, file_id, file_unique_id, file_name,
+             nickname, mime_type, file_size),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM files WHERE id = ?", (cur.lastrowid,)).fetchone()
+        return dict(row)
+    finally:
+        conn.close()
+
+
+def list_files(
+    chat_id: int,
+    topic_id: int | None = None,
+    include_subtopics: bool = True,
+    limit: int = 50,
+) -> list[dict]:
+    """Files for the chat. With a topic_id, returns files attached to that
+    topic AND everything nested beneath it (its subtree) by default -- so
+    "the study-notes files" resolves to that topic and everything under it,
+    the same subtree model every other query uses."""
+    conn = get_connection()
+    try:
+        sql = (
+            "SELECT files.*, topics.name AS topic_name, topics.nickname AS topic_nickname "
+            "FROM files LEFT JOIN topics ON files.topic_id = topics.id "
+            "WHERE files.chat_id = ?"
+        )
+        params: list = [chat_id]
+        if topic_id is not None:
+            if include_subtopics:
+                ids = get_topic_subtree_ids(conn, chat_id, topic_id)
+                sql += f" AND files.topic_id IN ({','.join('?' * len(ids))})"
+                params.extend(ids)
+            else:
+                sql += " AND files.topic_id = ?"
+                params.append(topic_id)
+        sql += " ORDER BY files.uploaded_at DESC LIMIT ?"
+        params.append(limit)
+        return [dict(r) for r in conn.execute(sql, params).fetchall()]
+    finally:
+        conn.close()
+
+
+def set_file_nickname(chat_id: int, file_id_row: int, nickname: str) -> dict | None:
+    """Set a file's nickname (by its row id, not the Telegram file_id)."""
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            "UPDATE files SET nickname = ? WHERE id = ? AND chat_id = ?",
+            (nickname, file_id_row, chat_id),
+        )
+        conn.commit()
+        if cur.rowcount == 0:
+            return None
+        row = conn.execute("SELECT * FROM files WHERE id = ?", (file_id_row,)).fetchone()
+        return dict(row)
+    finally:
+        conn.close()
+
+
+def delete_file(chat_id: int, file_row_id: int) -> bool:
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            "DELETE FROM files WHERE id = ? AND chat_id = ?", (file_row_id, chat_id)
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+# --- deletes -----------------------------------------------------------------
+
+def delete_topic(chat_id: int, topic_id: int) -> dict:
+    """Delete a topic and, via ON DELETE CASCADE on every child FK
+    (parent_topic_id, tasks.topic_id, notes.topic_id, schedule_blocks.topic_id,
+    reminders.linked_topic_id, files.topic_id), everything nested underneath and
+    attached to it. Returns a count of what was removed so the caller can tell
+    the user exactly what a cascade took, rather than silently vaporizing a
+    whole semester's worth of data. FK enforcement is per-connection PRAGMA, so
+    it's asserted here rather than assumed."""
+    conn = get_connection()
+    try:
+        topic = conn.execute(
+            "SELECT * FROM topics WHERE id = ? AND chat_id = ?", (topic_id, chat_id)
+        ).fetchone()
+        if topic is None:
+            raise ValueError(f"No topic #{topic_id} for this chat.")
+
+        subtree = get_topic_subtree_ids(conn, chat_id, topic_id)
+        ph = ",".join("?" * len(subtree))
+        counts = {
+            "topics": len(subtree),
+            "tasks": conn.execute(
+                f"SELECT COUNT(*) FROM tasks WHERE topic_id IN ({ph})", subtree
+            ).fetchone()[0],
+            "notes": conn.execute(
+                f"SELECT COUNT(*) FROM notes WHERE topic_id IN ({ph})", subtree
+            ).fetchone()[0],
+            "lessons": conn.execute(
+                f"SELECT COUNT(*) FROM schedule_blocks WHERE topic_id IN ({ph})", subtree
+            ).fetchone()[0],
+            "files": conn.execute(
+                f"SELECT COUNT(*) FROM files WHERE topic_id IN ({ph})", subtree
+            ).fetchone()[0],
+        }
+
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("DELETE FROM topics WHERE id = ? AND chat_id = ?", (topic_id, chat_id))
+        conn.commit()
+        return {"name": topic["name"], "counts": counts}
+    finally:
+        conn.close()
+
+
+def delete_task(chat_id: int, task_id: int) -> bool:
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            "DELETE FROM tasks WHERE id = ? AND chat_id = ?", (task_id, chat_id)
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def delete_note(chat_id: int, note_id: int) -> bool:
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            "DELETE FROM notes WHERE id = ? AND chat_id = ?", (note_id, chat_id)
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def delete_reminder(chat_id: int, reminder_id: int) -> bool:
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            "DELETE FROM reminders WHERE id = ? AND chat_id = ?", (reminder_id, chat_id)
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def delete_all_data(chat_id: int) -> dict:
+    """Wipe every row belonging to this chat across every table -- but ONLY
+    this chat's rows (WHERE chat_id = ?), never other chats' data and never
+    the schema itself. Returns per-table counts of what was removed. notes,
+    files, tasks, etc. all carry chat_id, so this is scoped deletion, not a
+    table drop."""
+    conn = get_connection()
+    try:
+        counts = {}
+        # Order children-before-parents so a row is counted before its
+        # potential cascade removes it; all are scoped by chat_id regardless.
+        for table in ("files", "reminders", "progress_logs", "notes",
+                      "schedule_blocks", "tasks", "topics"):
+            # progress_logs has no chat_id column -- delete via its topic's chat.
+            if table == "progress_logs":
+                n = conn.execute(
+                    "SELECT COUNT(*) FROM progress_logs WHERE topic_id IN "
+                    "(SELECT id FROM topics WHERE chat_id = ?)", (chat_id,)
+                ).fetchone()[0]
+                conn.execute(
+                    "DELETE FROM progress_logs WHERE topic_id IN "
+                    "(SELECT id FROM topics WHERE chat_id = ?)", (chat_id,)
+                )
+            else:
+                n = conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE chat_id = ?", (chat_id,)
+                ).fetchone()[0]
+                conn.execute(f"DELETE FROM {table} WHERE chat_id = ?", (chat_id,))
+            counts[table] = n
+        # chat_settings too -- reset the chat's config.
+        conn.execute("DELETE FROM chat_settings WHERE chat_id = ?", (chat_id,))
+        conn.commit()
+        return counts
+    finally:
+        conn.close()
 
 
 def create_task(
