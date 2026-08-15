@@ -366,6 +366,22 @@ async def pdf_import_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             summary.append("")
             summary.append(f"{len(failed)} could not be imported:")
             summary.extend(f"• {f}" for f in failed)
+        # Proactive, not reactive: a week-numbered pattern (Wk2-13, Wk4,5...)
+        # is meaningless until the semester start date is set -- otherwise
+        # this only ever surfaces later as an AnchorNotSetError when the user
+        # happens to ask for a specific week, with no link back to "this is
+        # why your imported classes aren't showing up."
+        has_week_numbered = any(
+            (e.get("week_pattern") or "every") != "every"
+            for e in result["schedule_entries"]
+        )
+        if has_week_numbered and database.get_semester_anchor(chat_id) is None:
+            summary.append("")
+            summary.append(
+                "Some of these classes only run in specific weeks (e.g. Wk2-13) "
+                "-- tell me which date week 1 starts so I can work out real "
+                "calendar dates for them, e.g. \"week 1 starts 12 August\"."
+            )
         await query.edit_message_text("\n".join(summary))
         _queue_nav_note(
             context,

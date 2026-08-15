@@ -85,8 +85,16 @@ EXTRACTION_SYSTEM_PROMPT = (
     "- week_label_raw: copy the week-range text printed in the cell VERBATIM "
     "(e.g. \"Wk2-13\", \"Wk1,3,5,7,9,11,13\"). Use null if the cell shows no "
     "week label at all. Do NOT expand or interpret it.\n"
-    "- A single time cell may stack multiple classes (e.g. a lecture and a lab) "
-    "-- emit one schedule_entries object per class, never merged."
+    "- A single time cell can stack MULTIPLE, DISTINCT class entries -- not "
+    "just a lecture-plus-lab for the same course. Two ENTIRELY DIFFERENT "
+    "course codes can share the identical day/time slot, distinguished ONLY "
+    "by different week ranges printed in the same cell (e.g. one course at "
+    "'Wk2,3' and a different course at 'Wk4,5', same day, same start/end "
+    "time, same physical cell). Read every line of text inside a cell "
+    "separately -- each course_code + week_label_raw pairing is its own "
+    "schedule_entries object, even when the day/time is identical to another "
+    "entry right next to it. NEVER merge two different course codes into one "
+    "entry, and never let one entry's week_label_raw absorb another's."
 )
 
 
