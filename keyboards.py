@@ -4,6 +4,7 @@ layer. Pure builder functions only -- no I/O, no database calls.
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 
+TODAY_LABEL = "\U0001F4C5 Today"
 TASKS_LABEL = "\U0001F4CB Tasks"
 REMINDERS_LABEL = "⏰ Reminders"
 TOPICS_LABEL = "\U0001F4DA Topics"
@@ -15,7 +16,7 @@ EVENTS_LABEL = "\U0001F5D3️ Events"
 # button-press text (an ordinary text message, as far as Telegram/PTB is
 # concerned) can never drift apart.
 NAV_LABELS = frozenset(
-    {TASKS_LABEL, REMINDERS_LABEL, TOPICS_LABEL, NOTES_LABEL, EVENTS_LABEL}
+    {TODAY_LABEL, TASKS_LABEL, REMINDERS_LABEL, TOPICS_LABEL, NOTES_LABEL, EVENTS_LABEL}
 )
 
 # 2-letter codes used in callback_data (e.g. "task:status:42:ip") instead of
@@ -42,6 +43,10 @@ SNOOZE_DURATIONS = {
 def persistent_reply_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
+            # Today is the daily-driver "what do I do right now" view -- given
+            # its own full-width top row so it reads as the primary action
+            # rather than one browser among five.
+            [TODAY_LABEL],
             [TASKS_LABEL, REMINDERS_LABEL],
             [TOPICS_LABEL, NOTES_LABEL],
             [EVENTS_LABEL],

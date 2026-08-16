@@ -32,7 +32,11 @@ def _container_label(row: dict) -> str:
 def build_tasks_view(chat_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
     tasks = database.query_tasks(chat_id=chat_id)
     if not tasks:
-        return "You don't have any tasks yet.", None
+        return (
+            "You don't have any tasks yet. Just tell me, e.g. \"add a task to "
+            "finish the report by Friday\".",
+            None,
+        )
     lines = []
     for t in tasks:
         deadline_part = f", due {t['deadline']}" if t["deadline"] else ""
@@ -46,7 +50,11 @@ def build_tasks_view(chat_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
 def build_reminders_view(chat_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
     reminders = database.list_pending_reminders(chat_id)
     if not reminders:
-        return "You don't have any upcoming reminders.", None
+        return (
+            "You don't have any upcoming reminders. Just tell me, e.g. "
+            "\"remind me to call mom at 6pm\".",
+            None,
+        )
     tz_name = os.environ.get("TIMEZONE", "UTC")
     lines = []
     for r in reminders:
@@ -160,7 +168,11 @@ def build_topic_delete_confirm_view(
 def build_notes_view(chat_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
     notes = database.query_notes(chat_id=chat_id, limit=20)
     if not notes:
-        return "You don't have any notes yet.", None
+        return (
+            "You don't have any notes yet. Just tell me, e.g. \"note under "
+            "Backpropagation: chain rule intuition\".",
+            None,
+        )
     lines = []
     for n in notes:
         tag = "[reference] " if n["is_reference"] else ""
@@ -175,7 +187,11 @@ def build_notes_view(chat_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
 def build_events_root_view(chat_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
     events = database.list_event_topics(chat_id, upcoming_only=True)
     if not events:
-        return "You don't have any upcoming events yet.", None
+        return (
+            "You don't have any upcoming events yet. Just tell me, e.g. "
+            "\"I have a hackathon on 15 March\".",
+            None,
+        )
     return "Choose an event:", keyboards.event_list_keyboard(events)
 
 
@@ -489,7 +505,9 @@ async def events_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Here's your menu:", reply_markup=keyboards.persistent_reply_keyboard()
+        "Here's your menu. You can also just talk to me naturally — "
+        "tap /help for examples.",
+        reply_markup=keyboards.persistent_reply_keyboard(),
     )
 
 
@@ -564,7 +582,9 @@ async def nav_button_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if update.message is None or update.message.text is None:
         return
     label = update.message.text
-    if label == keyboards.TASKS_LABEL:
+    if label == keyboards.TODAY_LABEL:
+        await today_command(update, context)
+    elif label == keyboards.TASKS_LABEL:
         await tasks_command(update, context)
     elif label == keyboards.REMINDERS_LABEL:
         await reminders_command(update, context)

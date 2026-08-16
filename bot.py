@@ -83,7 +83,10 @@ async def post_shutdown(application: Application) -> None:
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Hi, I'm Kangani. What can I help you track?",
+        "Hi, I'm Kangani. Just talk to me naturally — \"remind me to call mom "
+        "at 6pm\", \"add a task to finish the report by Friday\", or drop in "
+        "your timetable PDF. Tap /help to see everything I can do, or use the "
+        "buttons below.",
         reply_markup=keyboards.persistent_reply_keyboard(),
     )
 
