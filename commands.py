@@ -554,8 +554,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(text)
 
 
-async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
+def build_settings_view(chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
     tz_name = os.environ.get("TIMEZONE", "UTC")
     anchor = database.get_semester_anchor(chat_id)
     anchor_line = (
@@ -564,6 +563,7 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         else "Semester week 1 starts: not set (tell me which date week 1 begins)"
     )
     fmt = database.get_timetable_label_format(chat_id)
+    fmt_name = keyboards.LABEL_FORMAT_NAMES.get(fmt, fmt)
     recess = database.get_recess_weeks(chat_id)
     recess_line = (
         f"Recess weeks: {', '.join(str(w) for w in recess)}" if recess
@@ -573,13 +573,17 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         f"Timezone: {tz_name} (server-configured)\n"
         f"{anchor_line}\n"
         f"{recess_line}\n"
-        f"Timetable labels: {fmt}\n\n"
-        "Change any of these just by telling me (e.g. \"week 1 starts 12 Aug\", "
-        "\"use nicknames on the timetable\")."
+        f"Timetable labels: {fmt_name}\n\n"
+        "Tap 🏷 to cycle how modules are labelled on the timetable. Change the "
+        "rest just by telling me (e.g. \"week 1 starts 12 Aug\", \"recess week "
+        "is week 7\")."
     )
-    await update.message.reply_text(
-        text, reply_markup=keyboards.settings_keyboard()
-    )
+    return text, keyboards.settings_keyboard(fmt)
+
+
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text, kb = build_settings_view(update.effective_chat.id)
+    await update.message.reply_text(text, reply_markup=kb)
 
 
 async def nav_button_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

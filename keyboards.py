@@ -238,9 +238,29 @@ def topic_delete_confirm_keyboard(topic_id: int) -> InlineKeyboardMarkup:
     )
 
 
-def settings_keyboard() -> InlineKeyboardMarkup:
+# Timetable label-format options, in the order the settings toggle cycles them.
+# Values must match database.set_timetable_label_format's accepted enum.
+LABEL_FORMAT_ORDER = ["code", "nickname", "full_name", "code_nickname", "code_full_name"]
+LABEL_FORMAT_NAMES = {
+    "code": "Code (SC2001)",
+    "nickname": "Nickname (DSA)",
+    "full_name": "Full name (Algorithms)",
+    "code_nickname": "Code + nickname (SC2001: DSA)",
+    "code_full_name": "Code + full name (SC2001: Algorithms)",
+}
+
+
+def settings_keyboard(label_format: str = "code") -> InlineKeyboardMarkup:
+    name = LABEL_FORMAT_NAMES.get(label_format, label_format)
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🗑 Delete all my data", callback_data="settings:delall:1")]]
+        [
+            # Benign control first: a one-tap cycle through timetable label
+            # formats, showing the current value so it's self-documenting. Kept
+            # visually separate from -- and above -- the destructive delete-all,
+            # so the only interactive control isn't the nuclear one.
+            [InlineKeyboardButton(f"🏷 Labels: {name}", callback_data="settings:label:next")],
+            [InlineKeyboardButton("🗑 Delete all my data", callback_data="settings:delall:1")],
+        ]
     )
 
 

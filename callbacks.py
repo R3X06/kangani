@@ -202,7 +202,26 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     query = update.callback_query
     chat_id = update.effective_chat.id
     try:
-        step = query.data.split(":")[2]
+        parts = query.data.split(":")
+        action = parts[1]
+
+        if action == "label":
+            # Cycle the timetable label format to the next option and re-render
+            # the whole settings view (so the "Timetable labels: X" text line
+            # updates alongside the button). One tap, no submenu -- 5 formats
+            # would be a lot of buttons, and the button already shows the
+            # current value, so cycling is the lightest self-documenting control.
+            current = database.get_timetable_label_format(chat_id)
+            order = keyboards.LABEL_FORMAT_ORDER
+            nxt = order[(order.index(current) + 1) % len(order)] if current in order else order[0]
+            database.set_timetable_label_format(chat_id, nxt)
+            text, kb = commands.build_settings_view(chat_id)
+            await query.edit_message_text(text, reply_markup=kb)
+            await query.answer(f"Timetable labels: {keyboards.LABEL_FORMAT_NAMES[nxt]}")
+            return
+
+        # action == "delall" -- the two-step irreversible wipe.
+        step = parts[2]
         if step == "1":
             await query.edit_message_text(
                 "Delete ALL your data — every topic, task, note, reminder, "
