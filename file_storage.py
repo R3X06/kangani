@@ -100,6 +100,14 @@ async def handle_file_upload_reply(
 ) -> bool:
     """Intercept the plain-text reply naming which topic an uploaded file goes
     under. Returns True if it consumed the message, False if nothing's pending.
+
+    Two states, both keyed off chat_data:
+      - file_upload_pending: the file is awaiting a topic name (or "none").
+      - file_upload_pending_pick: a typed name matched MORE THAN ONE topic, and
+        we're now awaiting a "# id" pick among that specific candidate set.
+    The pick state is checked first, because while it's set the reply is a
+    number (the chosen id), not a topic name -- running the name matcher on it
+    (the original bug) always missed and dead-ended on "No topic named '2'".
     """
     pending = context.chat_data.get("file_upload_pending")
     if not pending:
@@ -108,30 +116,90 @@ async def handle_file_upload_reply(
     chat_id = update.effective_chat.id
     text = (update.message.text or "").strip()
 
-    topic_id = None
-    topic_label = "unfiled"
-    if text.lower() not in ("none", "no", "skip", "unfiled"):
-        # Reuse the same exact-name/nickname matcher the PDF import uses.
-        matches = _match_topics(chat_id, text)
-        if not matches:
-            await update.message.reply_text(
-                f"No topic named '{text}'. Try again, or reply \"none\" to keep "
-                "it unfiled."
-            )
-            return True
-        if len(matches) > 1:
-            context.chat_data["file_upload_pending_pick"] = {
-                "text": text, "matches": [m["id"] for m in matches],
-            }
-            lines = "\n".join(f"#{m['id']} {m['path']}" for m in matches)
-            await update.message.reply_text(
-                f"{len(matches)} topics named '{text}':\n{lines}\n\n"
-                "Reply with the # id of the one you mean."
-            )
-            return True
-        topic_id = matches[0]["id"]
-        topic_label = matches[0]["path"]
+    # --- disambiguation state: a prior reply matched multiple topics ---------
+    pick = context.chat_data.get("file_upload_pending_pick")
+    if pick:
+        low = text.lower()
+        if low in ("none", "no", "skip", "unfiled", "cancel"):
+            # Bail out of the pick and file it unfiled.
+            context.chat_data.pop("file_upload_pending_pick", None)
+            return await _finalize_file(update, context, pending, None, "unfiled")
 
+        # Accept the chosen id -- but ONLY one of the ids we actually offered,
+        # so a stray number can't file the file under some unrelated topic the
+        # user never disambiguated. Tolerate a leading '#'.
+        allowed = {m["id"]: m for m in pick["matches"]}
+        try:
+            chosen = int(low.lstrip("#").strip())
+        except ValueError:
+            chosen = None
+        if chosen is None or chosen not in allowed:
+            offered = ", ".join(f"#{i}" for i in allowed)
+            await update.message.reply_text(
+                f"Reply with one of these ids: {offered} (or \"none\" to keep it "
+                "unfiled)."
+            )
+            return True
+
+        # Re-verify the topic still exists (it could have been deleted between
+        # the prompt and this pick); use the path we already captured for the
+        # label rather than re-fetching it (get_topic returns a raw row with no
+        # computed breadcrumb path).
+        if database.get_topic(chat_id, chosen) is None:
+            context.chat_data.pop("file_upload_pending_pick", None)
+            await update.message.reply_text(
+                "That topic no longer exists. Reply with another topic name, or "
+                "\"none\" to keep it unfiled."
+            )
+            return True
+        context.chat_data.pop("file_upload_pending_pick", None)
+        return await _finalize_file(
+            update, context, pending, chosen, allowed[chosen]["path"]
+        )
+
+    # --- initial state: reply names a topic (or "none") ----------------------
+    if text.lower() in ("none", "no", "skip", "unfiled"):
+        return await _finalize_file(update, context, pending, None, "unfiled")
+
+    # Reuse the same exact-name/nickname matcher the PDF import uses.
+    matches = _match_topics(chat_id, text)
+    if not matches:
+        await update.message.reply_text(
+            f"No topic named '{text}'. Try again, or reply \"none\" to keep "
+            "it unfiled."
+        )
+        return True
+    if len(matches) > 1:
+        # Store id + breadcrumb path per candidate (not just ids) so the pick
+        # branch can label the save without re-fetching -- get_topic returns a
+        # raw row with no computed path.
+        context.chat_data["file_upload_pending_pick"] = {
+            "text": text,
+            "matches": [{"id": m["id"], "path": m["path"]} for m in matches],
+        }
+        lines = "\n".join(f"#{m['id']} {m['path']}" for m in matches)
+        await update.message.reply_text(
+            f"{len(matches)} topics named '{text}':\n{lines}\n\n"
+            "Reply with the # id of the one you mean."
+        )
+        return True
+    return await _finalize_file(
+        update, context, pending, matches[0]["id"], matches[0]["path"]
+    )
+
+
+async def _finalize_file(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    pending: dict,
+    topic_id: int | None,
+    topic_label: str,
+) -> bool:
+    """Persist the pending file under `topic_id` (or unfiled), clear both
+    pending-state flags, and confirm. Shared by every terminal branch of
+    handle_file_upload_reply so the save + cleanup + confirmation is written
+    once."""
+    chat_id = update.effective_chat.id
     saved = database.create_file(
         chat_id=chat_id,
         file_id=pending["file_id"],

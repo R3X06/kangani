@@ -12,13 +12,21 @@ templating equivalent of the html.escape the text views do by hand.
 """
 
 from datetime import date
+from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 import timetable_data
 
+# Anchor the template dir to THIS file's location, not the process CWD. A bare
+# FileSystemLoader("templates") resolves relative to wherever the bot was
+# launched from -- fine under the Dockerfile (WORKDIR /app) but a
+# TemplateNotFound waiting to happen under any launcher that starts from a
+# different directory (systemd, cron, a process manager).
+_TEMPLATE_DIR = Path(__file__).parent / "templates"
+
 _env = Environment(
-    loader=FileSystemLoader("templates"),
+    loader=FileSystemLoader(str(_TEMPLATE_DIR)),
     autoescape=select_autoescape(["html"]),
     trim_blocks=True,
     lstrip_blocks=True,

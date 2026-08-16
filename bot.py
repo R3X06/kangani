@@ -114,6 +114,17 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if await callbacks.handle_topic_edit_reply(update, context):
         return
 
+    # Nav-button taps arrive as plain text too. Checked AFTER the pending-reply
+    # interceptors above (not as a separately pre-registered handler) so a nav
+    # tap sent while Kangani is mid-way through asking a question (PDF import
+    # root, file-upload topic, topic rename/nickname/subtopic) never bypasses
+    # that question -- it either answers it or, if the text happens to also be
+    # a nav label, is treated as the answer, not a navigation. Only text that
+    # isn't consumed by any pending prompt is checked against NAV_LABELS.
+    if update.message.text in keyboards.NAV_LABELS:
+        await commands.nav_button_pressed(update, context)
+        return
+
     chat_id = update.effective_chat.id
     user_text = update.message.text
     history = context.chat_data.setdefault("history", [])
@@ -183,10 +194,12 @@ def main() -> None:
         )
     )
 
-    # Nav-button presses arrive as plain text -- this handler is registered
-    # BEFORE the catch-all so PTB routes matching button labels here first,
-    # never reaching brain.get_response() (no LLM call for pure navigation).
-    application.add_handler(MessageHandler(filters.Text(keyboards.NAV_LABELS), commands.nav_button_pressed))
+    # Nav-button presses arrive as plain text -- dispatched from INSIDE
+    # message_handler (after the pending-reply interceptors), not as a
+    # separately pre-registered handler here. See message_handler's comment
+    # for why: a pre-registered handler would match a nav label even while a
+    # pdf_import/file_storage/topic_edit reply is pending, silently
+    # swallowing that prompt's answer.
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
     application.add_handler(CallbackQueryHandler(callbacks.task_callback, pattern=r"^task:"))

@@ -18,6 +18,12 @@ logger = logging.getLogger(__name__)
 
 DB_PATH = Path(os.environ.get("DB_PATH", str(Path(__file__).parent / "kangani.db")))
 
+# When DB_PATH points somewhere other than the repo dir -- e.g. a mounted
+# Railway volume at /data/kangani.db -- that directory won't exist on a fresh
+# volume, and sqlite3.connect would fail with "unable to open database file".
+# Create it up front (no-op when it already exists, incl. the local default).
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
 
 def _now_utc_iso() -> str:
     """Canonical UTC 'YYYY-MM-DDTHH:MM:SS.mmmZ' timestamp -- the same format
@@ -232,6 +238,12 @@ def get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # WAL lets the reminder-firing job (and startup reschedule) read while a
+    # conversational write is in flight, instead of the default journal mode's
+    # writer blocking readers -- the standard choice for a persisted SQLite on
+    # a Railway volume. It's a persistent per-DB setting (survives reconnects),
+    # so re-issuing it every connection is a cheap idempotent no-op.
+    conn.execute("PRAGMA journal_mode = WAL")
     return conn
 
 
@@ -1649,6 +1661,7 @@ def create_schedule_block(
     day_of_week: str | None = None,
     specific_date: str | None = None,
     module_name: str | None = None,
+    topic_id: int | None = None,
     class_type: str | None = None,
     location: str | None = None,
     week_pattern: str = "every",
@@ -1657,6 +1670,10 @@ def create_schedule_block(
         raise ValueError(
             "Exactly one of day_of_week or specific_date must be given "
             "(recurring blocks use day_of_week, one-off blocks use specific_date)."
+        )
+    if module_name is not None and topic_id is not None:
+        raise ValueError(
+            "Give at most one of module_name or topic_id, not both."
         )
     if not _TIME_RE.match(start_time):
         raise ValueError(f"start_time must be 24-hour HH:MM, got {start_time!r}")
@@ -1671,12 +1688,19 @@ def create_schedule_block(
             ) from None
     week_pattern = _validate_week_pattern(week_pattern)
 
-    # `module_name` is kept as a convenience for callers (the NL tool schema,
-    # the PDF import path): a class's module is just a topic with kind='module',
-    # resolved/created here so those callers never deal in topic_ids.
-    topic_id = (
-        resolve_module_topic(chat_id, module_name)["id"] if module_name else None
-    )
+    # A class's module is just a topic with kind='module'. Two ways in:
+    #   - module_name: the convenience path (NL tool schema) -- resolve/create
+    #     the module topic by name here so that caller never deals in topic_ids.
+    #   - topic_id: an ALREADY-resolved module topic id, passed straight through.
+    #     The PDF-import confirm loop uses this: it resolves each module ONCE
+    #     (respecting the import's target parent), then reuses that id across all
+    #     of the module's class blocks, instead of re-running a full tree scan by
+    #     name per block. Validate ownership since it's a raw id from a caller.
+    if topic_id is not None:
+        if get_topic(chat_id, topic_id) is None:
+            raise ValueError(f"No topic #{topic_id} for this chat.")
+    elif module_name:
+        topic_id = resolve_module_topic(chat_id, module_name)["id"]
     conn = get_connection()
     try:
         cur = conn.execute(

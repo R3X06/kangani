@@ -21,6 +21,19 @@ RUN playwright install --with-deps chromium
 
 COPY . .
 
+# --- Persistence -----------------------------------------------------------
+# The SQLite DB must live on a mounted Railway VOLUME, not the container
+# filesystem -- the container FS is rebuilt on every redeploy and would wipe
+# all reminders/tasks/notes. Attach a volume in the Railway dashboard with
+# mount path /data; this points the app at a file on it. (database.py reads
+# DB_PATH and creates the parent dir at startup.)
+#
+# Volumes mount as ROOT while the container may run as non-root, so writes can
+# fail with a permission error -- RAILWAY_RUN_UID=0 runs the process as root so
+# it can write to the volume. See DEPLOY.md for the full volume setup.
+ENV DB_PATH=/data/kangani.db
+ENV RAILWAY_RUN_UID=0
+
 # Not a web service -- this is PTB's long-polling loop, so no port to expose
 # or bind. Railway doesn't require one for a background worker.
 CMD ["python", "bot.py"]
