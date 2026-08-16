@@ -1120,6 +1120,32 @@ def get_reminder(chat_id: int, reminder_id: int) -> dict | None:
         conn.close()
 
 
+def reschedule_reminder(
+    chat_id: int, reminder_id: int, new_trigger_datetime_utc: str
+) -> dict | None:
+    """Move a still-PENDING reminder's trigger time in place. Returns the
+    updated row, or None if there's no such pending reminder for this chat
+    (already fired/cancelled, or wrong chat). Unlike snoozing a fired reminder
+    -- which creates a fresh reminder -- pushing back an upcoming one should
+    reuse the same row so the list never shows the same reminder twice."""
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            "UPDATE reminders SET trigger_data = ? "
+            "WHERE id = ? AND chat_id = ? AND status = 'pending'",
+            (new_trigger_datetime_utc, reminder_id, chat_id),
+        )
+        conn.commit()
+        if cur.rowcount == 0:
+            return None
+        row = conn.execute(
+            "SELECT * FROM reminders WHERE id = ?", (reminder_id,)
+        ).fetchone()
+        return dict(row)
+    finally:
+        conn.close()
+
+
 def cancel_reminder(chat_id: int, reminder_id: int) -> dict | None:
     conn = get_connection()
     try:

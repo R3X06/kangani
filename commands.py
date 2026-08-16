@@ -181,7 +181,11 @@ def build_notes_view(chat_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
         lines.append(
             f"#{n['id']} [{where}] {tag}{n['content']}{source_part}"
         )
-    return "\n".join(lines), None
+    kb = keyboards.notes_list_keyboard(notes)
+    if kb is not None:
+        lines.append("")
+        lines.append("Tap a note below to open its topic.")
+    return "\n".join(lines), kb
 
 
 def build_events_root_view(chat_id: int) -> tuple[str, InlineKeyboardMarkup | None]:

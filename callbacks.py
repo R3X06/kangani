@@ -144,6 +144,43 @@ async def reminder_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 f"{query.message.text}\n\n(snoozed {duration_label})", reply_markup=None
             )
 
+        elif action == "pushback":
+            # Reschedule an UPCOMING reminder in place from the list view. This
+            # differs from "snooze" (fired-reminder) two ways: it moves the
+            # existing row rather than creating a new reminder, and it re-renders
+            # the whole list rather than editing one message. Push-back is
+            # measured from now, so "+10m" always means 10 minutes from the tap.
+            code = parts[3]
+            duration_label, seconds = keyboards.SNOOZE_DURATIONS[code]
+            new_trigger_dt = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+            new_trigger_str = scheduler.format_utc_iso(new_trigger_dt)
+            reminder = database.reschedule_reminder(
+                chat_id, reminder_id, new_trigger_str
+            )
+            if reminder is None:
+                # Already fired/cancelled between render and tap -- just refresh.
+                text, kb = commands.build_reminders_view(chat_id)
+                await query.edit_message_text(text, reply_markup=kb)
+                await query.answer("That reminder is no longer pending.")
+                return
+            # Replace the in-memory job so it fires at the new time.
+            for job in context.job_queue.get_jobs_by_name(f"reminder-{reminder_id}"):
+                job.schedule_removal()
+            scheduler.schedule_reminder(
+                context.job_queue,
+                reminder_id,
+                chat_id,
+                new_trigger_dt,
+                reminder["message"],
+            )
+            _queue_nav_note(
+                context,
+                f"User pushed back a reminder ('{reminder['message']}') by "
+                f"{duration_label} via a button tap.",
+            )
+            text, kb = commands.build_reminders_view(chat_id)
+            await query.edit_message_text(text, reply_markup=kb)
+
         elif action == "cancel":
             reminder = database.cancel_reminder(chat_id, reminder_id)
             if reminder is not None:

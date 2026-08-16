@@ -116,15 +116,53 @@ def reminder_fired_keyboard(reminder_id: int) -> InlineKeyboardMarkup:
 
 
 def reminder_list_keyboard(reminders: list[dict]) -> InlineKeyboardMarkup:
-    rows = [
-        [
-            InlineKeyboardButton(
-                f"❌ Cancel #{r['id']}", callback_data=f"rem:cancel:{r['id']}"
-            )
-        ]
-        for r in reminders
-    ]
+    # Per reminder: a push-back row (reschedule the still-pending reminder in
+    # place, reusing SNOOZE_DURATIONS' codes) plus a Cancel row. "pushback" is a
+    # distinct action from the fired-reminder "snooze" because it MOVES the
+    # existing reminder rather than creating a fresh one -- see reminder_callback.
+    rows = []
+    for r in reminders:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "⏰ +10m", callback_data=f"rem:pushback:{r['id']}:10m"
+                ),
+                InlineKeyboardButton(
+                    "⏰ +1h", callback_data=f"rem:pushback:{r['id']}:1h"
+                ),
+                InlineKeyboardButton(
+                    f"❌ Cancel #{r['id']}", callback_data=f"rem:cancel:{r['id']}"
+                ),
+            ]
+        )
     return InlineKeyboardMarkup(rows)
+
+
+def notes_list_keyboard(notes: list[dict]) -> InlineKeyboardMarkup | None:
+    """One row per FILED note, jumping to its parent topic (reusing the topic
+    callback unchanged). General notes (topic_id is None) get no button -- there
+    is nowhere to jump to. Returns None if nothing is jumpable, so the caller
+    can send a plain message rather than an empty keyboard."""
+    rows = []
+    for n in notes:
+        topic_id = n.get("topic_id")
+        if topic_id is None:
+            continue
+        where = n.get("topic_name") or "topic"
+        # Short preview so the button is recognisable without echoing the whole
+        # note; Telegram truncates long button labels anyway.
+        preview = (n.get("content") or "").strip().replace("\n", " ")
+        if len(preview) > 24:
+            preview = preview[:23] + "…"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"📚 #{n['id']} → {where}: {preview}",
+                    callback_data=f"topic:open:{topic_id}",
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(rows) if rows else None
 
 
 def topic_root_keyboard(topics: list[dict]) -> InlineKeyboardMarkup:
