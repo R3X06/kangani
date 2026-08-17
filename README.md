@@ -10,6 +10,7 @@ A Telegram personal assistant for managing study and daily life — topics, task
 - **Compositional calendar.** Ask for a topic and Kangani returns everything nested beneath it. `"Y3S1 calendar"` gives the full picture under Y3S1; `"Y3S1 lesson calendar"` narrows to just lessons; `"SC2001 tutorials"` narrows further. Every word before "calendar" is a filter that intersects with the others.
 - **Timetable.** Recurring weekly classes or one-off blocks, with per-class week patterns (odd/even/specific weeks), semester-week numbering, and recess weeks. Rendered as text or as a styled image.
 - **PDF import.** Drop in an NTU registration PDF; Kangani reads the timetable visually (the PDFs use custom-encoded fonts that defeat text extraction) and imports your classes after you confirm a preview.
+- **File storage.** Send any document, photo, or audio and file it under a topic; Kangani keeps a durable handle (via Telegram's own file servers) and hands it back whenever you ask.
 - **Categories & tags.** Tasks and lessons carry user-defined categories (assignment, lab, tutorial…) you can filter by. Every task, note, and reminder has a hidden stable tag — add `-tag` to any listing to reveal them.
 
 ## How a message flows
@@ -43,6 +44,7 @@ A nav-button tap short-circuits the LLM and renders a pre-built view directly. E
 | `keyboards.py` | Reply- and inline-keyboard builders |
 | `scheduler.py` | Reminder scheduling, week-number logic |
 | `pdf_import.py` | NTU timetable PDF import (vision) |
+| `file_storage.py` | Store/retrieve uploaded files under topics (via Telegram file IDs) |
 | `timetable_data.py` | Assembles data for timetable rendering |
 | `timetable_image.py` | Renders timetable HTML into an image |
 | `templates/` | Daily / weekly / monthly timetable HTML |
@@ -64,7 +66,11 @@ cp .env.example .env                # then fill in your tokens
 python bot.py
 ```
 
-`.env` needs `TELEGRAM_BOT_TOKEN` (from @BotFather), `ANTHROPIC_API_KEY` (from console.anthropic.com — make sure the workspace has billing set up), and `TIMEZONE`.
+`.env` needs `TELEGRAM_BOT_TOKEN` (from @BotFather), `ANTHROPIC_API_KEY` (from console.anthropic.com — make sure the workspace has billing set up), and `TIMEZONE`. `DB_PATH` is optional locally (defaults to `./kangani.db`) but matters when deploying — see below.
+
+## Deployment
+
+The bot runs as a long-polling **background worker** (no inbound HTTP, no port). The included `Dockerfile` installs everything it needs (poppler for PDF import, Chromium for timetable images). The one thing that needs care is persistence: the SQLite database must live on a mounted volume, or every redeploy wipes it. `DB_PATH` points the app at that volume (defaulted to `/data/kangani.db` in the Dockerfile). See **[DEPLOY.md](DEPLOY.md)** for the full Railway walkthrough (volume mount, env vars, the root-UID gotcha, and backups).
 
 ## Roadmap
 

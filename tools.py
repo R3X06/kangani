@@ -720,8 +720,11 @@ TOOL_SCHEMAS = [
             "given, recurring blocks are expanded into actual dated occurrences "
             "within that range and the result is date-ordered (use this for "
             "'what's on today/this week' -- compute the bounds yourself from "
-            "the current date shown in the system prompt). If omitted, returns "
-            "the raw weekly timetable plus one-off blocks, unexpanded. "
+            "the current date shown in the system prompt). date_from/date_to "
+            "together can span at most 400 days -- fine for a full semester "
+            "or academic year in one call; for anything longer, issue "
+            "multiple calls and combine the results yourself. If omitted, "
+            "returns the raw weekly timetable plus one-off blocks, unexpanded. "
             "topic_id (with include_subtopics, default true) restricts to "
             "lessons under a topic and everything nested beneath it -- this is "
             "how a 'Y3S1 lesson calendar' works: resolve the topic, pass its "
@@ -1219,7 +1222,10 @@ def _handle_query_notes(tool_input: dict, chat_id: int, job_queue) -> str:
     return "\n".join(lines)
 
 
-_MAX_SCHEDULE_QUERY_DAYS = 90
+_MAX_SCHEDULE_QUERY_DAYS = 400  # generous enough for a full semester/academic
+# year in one call -- expand_occurrences() is a cheap linear pass over
+# (days x blocks), so this is purely a sanity ceiling against a nonsensical
+# accidental range (e.g. decades), not a real performance limit.
 
 
 async def _send_files_job(context) -> None:
