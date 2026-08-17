@@ -19,6 +19,7 @@ from telegram import InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 import database
+import flows
 import keyboards
 import scheduler
 import timetable_image
@@ -530,6 +531,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"{keyboards.TOPICS_LABEL} / /topics -- browse topics and notes\n"
         f"{keyboards.NOTES_LABEL} / /notes -- view recent notes\n"
         f"{keyboards.EVENTS_LABEL} / /events -- browse events (hackathons, talks)\n"
+        f"{keyboards.ADD_LABEL} / /new -- quick-add a task, reminder, or note by "
+        "tapping through buttons (no typing needed except the title/content)\n"
         "/menu -- show the menu again\n"
         "/settings -- view and change settings\n\n"
         "CAPTURE -- just tell me:\n"
@@ -604,3 +607,60 @@ async def nav_button_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await notes_command(update, context)
     elif label == keyboards.EVENTS_LABEL:
         await events_command(update, context)
+    elif label == keyboards.ADD_LABEL:
+        await flows.add_menu_command(update, context)
+
+
+# Deliberately narrow: ONLY bare, unscoped, unfiltered phrasings that are
+# genuinely 1:1 with an existing slash command / nav button -- exactly the
+# "no scope, no type filter, no time filter" case in brain.py's system
+# prompt's compositional-query rules. Anything with real content attached
+# ("tasks due Friday", "sc2001 labs", "add a task to...") still needs
+# Claude's topic/filter resolution and must NOT be added here -- a false
+# match would silently drop a constraint the user typed, which is worse than
+# spending a Claude call. Matching is exact (after lowercasing/stripping
+# trailing punctuation), not substring, to keep false positives at zero.
+TEXT_SHORTCUTS: dict[str, callable] = {
+    "menu": menu_command,
+    "help": help_command,
+    "settings": settings_command,
+    "today": today_command,
+    "what's today": today_command,
+    "whats today": today_command,
+    "week": week_command,
+    "this week": week_command,
+    "my week": week_command,
+    "tasks": tasks_command,
+    "my tasks": tasks_command,
+    "show tasks": tasks_command,
+    "show my tasks": tasks_command,
+    "reminders": reminders_command,
+    "my reminders": reminders_command,
+    "show reminders": reminders_command,
+    "topics": topics_command,
+    "my topics": topics_command,
+    "show topics": topics_command,
+    "notes": notes_command,
+    "my notes": notes_command,
+    "show notes": notes_command,
+    "events": events_command,
+    "my events": events_command,
+    "show events": events_command,
+}
+
+
+async def dispatch_text_shortcut(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """If the message text is an exact match (case-insensitive, punctuation-
+    stripped) for a known bare/unscoped phrase, run the equivalent slash
+    command directly and return True -- no Claude call for it. Returns False
+    (nothing sent) for anything else, so the caller falls through to
+    brain.get_response unchanged.
+    """
+    if update.message is None or update.message.text is None:
+        return False
+    normalized = update.message.text.strip().lower().rstrip("?!.")
+    handler = TEXT_SHORTCUTS.get(normalized)
+    if handler is None:
+        return False
+    await handler(update, context)
+    return True

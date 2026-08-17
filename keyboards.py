@@ -10,13 +10,15 @@ REMINDERS_LABEL = "⏰ Reminders"
 TOPICS_LABEL = "\U0001F4DA Topics"
 NOTES_LABEL = "\U0001F4DD Notes"
 EVENTS_LABEL = "\U0001F5D3️ Events"
+ADD_LABEL = "➕ Add"
 
 # Single source of truth for the reply-keyboard button labels, so the labels
 # used to BUILD the keyboard and the labels used to MATCH incoming
 # button-press text (an ordinary text message, as far as Telegram/PTB is
 # concerned) can never drift apart.
 NAV_LABELS = frozenset(
-    {TODAY_LABEL, TASKS_LABEL, REMINDERS_LABEL, TOPICS_LABEL, NOTES_LABEL, EVENTS_LABEL}
+    {TODAY_LABEL, TASKS_LABEL, REMINDERS_LABEL, TOPICS_LABEL, NOTES_LABEL,
+     EVENTS_LABEL, ADD_LABEL}
 )
 
 # 2-letter codes used in callback_data (e.g. "task:status:42:ip") instead of
@@ -49,7 +51,7 @@ def persistent_reply_keyboard() -> ReplyKeyboardMarkup:
             [TODAY_LABEL],
             [TASKS_LABEL, REMINDERS_LABEL],
             [TOPICS_LABEL, NOTES_LABEL],
-            [EVENTS_LABEL],
+            [EVENTS_LABEL, ADD_LABEL],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -200,6 +202,12 @@ def topic_detail_keyboard(
         [
             InlineKeyboardButton("✏️ Rename", callback_data=f"topic:rename:{topic_id}"),
             InlineKeyboardButton("🏷 Nickname", callback_data=f"topic:nick:{topic_id}"),
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton("➕ Task", callback_data=f"flow:new:task:{topic_id}"),
+            InlineKeyboardButton("📝 Note", callback_data=f"flow:new:note:{topic_id}"),
         ]
     )
     rows.append(
@@ -356,3 +364,97 @@ def event_detail_keyboard(
         )
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="event:root")])
     return InlineKeyboardMarkup(rows)
+
+
+# --- quick-add flows (flows.py) -----------------------------------------
+# All button-driven, no Claude call. Every keyboard below carries a Cancel
+# button so a flow can always be abandoned cleanly.
+
+def flow_new_item_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📋 Task", callback_data="flow:new:task"),
+                InlineKeyboardButton("⏰ Reminder", callback_data="flow:new:reminder"),
+                InlineKeyboardButton("📝 Note", callback_data="flow:new:note"),
+            ]
+        ]
+    )
+
+
+def flow_topic_picker_keyboard(topics: list[dict]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(t["path"], callback_data=f"flow:topic:{t['id']}")]
+        for t in topics
+    ]
+    rows.append(
+        [InlineKeyboardButton("🗂 No topic (unfiled)", callback_data="flow:topic:none")]
+    )
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="flow:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+FLOW_DEADLINE_PRESETS = [
+    ("today", "Today"),
+    ("tomorrow", "Tomorrow"),
+    ("fri", "This Friday"),
+    ("none", "No deadline"),
+]
+
+
+def flow_deadline_keyboard() -> InlineKeyboardMarkup:
+    preset_buttons = [
+        InlineKeyboardButton(label, callback_data=f"flow:deadline:{code}")
+        for code, label in FLOW_DEADLINE_PRESETS
+    ]
+    rows = [preset_buttons[i:i + 2] for i in range(0, len(preset_buttons), 2)]
+    rows.append([InlineKeyboardButton("📅 Custom date", callback_data="flow:deadline:custom")])
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="flow:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+FLOW_REMINDER_PRESETS = [
+    ("10m", "In 10 min"),
+    ("1h", "In 1 hour"),
+    ("3h", "In 3 hours"),
+    ("tom9", "Tomorrow 9am"),
+]
+
+
+def flow_remindtime_keyboard() -> InlineKeyboardMarkup:
+    preset_buttons = [
+        InlineKeyboardButton(label, callback_data=f"flow:remindtime:{code}")
+        for code, label in FLOW_REMINDER_PRESETS
+    ]
+    rows = [preset_buttons[i:i + 2] for i in range(0, len(preset_buttons), 2)]
+    rows.append([InlineKeyboardButton("📅 Custom date/time", callback_data="flow:remindtime:custom")])
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="flow:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def flow_category_keyboard(categories: list[str]) -> InlineKeyboardMarkup:
+    # Categories referenced by INDEX into the list already stashed in the
+    # flow's chat_data state (flows._get_state(...)["data"]["_category_options"]),
+    # not by their raw text -- a category name could itself contain ':' and
+    # break the callback_data parser, and Telegram caps callback_data at 64
+    # bytes anyway, so an index is both safer and shorter.
+    cat_buttons = [
+        InlineKeyboardButton(c, callback_data=f"flow:category:{i}")
+        for i, c in enumerate(categories)
+    ]
+    rows = [cat_buttons[i:i + 2] for i in range(0, len(cat_buttons), 2)]
+    rows.append([InlineKeyboardButton("No category", callback_data="flow:category:none")])
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="flow:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def flow_reference_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📌 Reference", callback_data="flow:ref:yes"),
+                InlineKeyboardButton("📝 Regular note", callback_data="flow:ref:no"),
+            ],
+            [InlineKeyboardButton("❌ Cancel", callback_data="flow:cancel")],
+        ]
+    )

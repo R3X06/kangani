@@ -20,6 +20,7 @@ import callbacks
 import commands
 import database
 import file_storage
+import flows
 import keyboards
 import pdf_import
 import scheduler
@@ -42,6 +43,7 @@ BOT_COMMANDS = [
     BotCommand("topics", "Browse your topics and notes"),
     BotCommand("notes", "View your recent notes"),
     BotCommand("events", "Browse your events"),
+    BotCommand("new", "Quickly add a task, reminder, or note"),
     BotCommand("help", "What Kangani can do"),
     BotCommand("settings", "View your current settings"),
 ]
@@ -117,6 +119,14 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if await callbacks.handle_topic_edit_reply(update, context):
         return
 
+    # A pending quick-add flow (task title, note content, reminder message,
+    # or a custom date/time) -- same pending-reply pattern as the three
+    # interceptors above. Checked here too, before nav labels: if a flow is
+    # mid-way through asking a question, a nav-label-looking reply answers
+    # the question rather than being treated as navigation.
+    if await flows.handle_flow_reply(update, context):
+        return
+
     # Nav-button taps arrive as plain text too. Checked AFTER the pending-reply
     # interceptors above (not as a separately pre-registered handler) so a nav
     # tap sent while Kangani is mid-way through asking a question (PDF import
@@ -126,6 +136,15 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # isn't consumed by any pending prompt is checked against NAV_LABELS.
     if update.message.text in keyboards.NAV_LABELS:
         await commands.nav_button_pressed(update, context)
+        return
+
+    # Bare unscoped phrases that are exact equivalents of an existing slash
+    # command ("tasks", "my reminders", "help") -- handled the same
+    # deterministic way as a nav-button tap, no Claude call. Deliberately
+    # checked AFTER the pending-reply interceptors above for the same reason
+    # NAV_LABELS is: a reply answering a pending question must not be
+    # reinterpreted as a shortcut just because it happens to match one.
+    if await commands.dispatch_text_shortcut(update, context):
         return
 
     chat_id = update.effective_chat.id
@@ -180,6 +199,7 @@ def main() -> None:
     application.add_handler(CommandHandler("topics", commands.topics_command))
     application.add_handler(CommandHandler("notes", commands.notes_command))
     application.add_handler(CommandHandler("events", commands.events_command))
+    application.add_handler(CommandHandler("new", flows.add_menu_command))
     application.add_handler(CommandHandler("menu", commands.menu_command))
     application.add_handler(CommandHandler("help", commands.help_command))
     application.add_handler(CommandHandler("settings", commands.settings_command))
@@ -209,6 +229,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(callbacks.reminder_callback, pattern=r"^rem:"))
     application.add_handler(CallbackQueryHandler(callbacks.topic_callback, pattern=r"^topic:"))
     application.add_handler(CallbackQueryHandler(callbacks.event_callback, pattern=r"^event:"))
+    application.add_handler(CallbackQueryHandler(flows.flow_callback, pattern=r"^flow:"))
     application.add_handler(CallbackQueryHandler(callbacks.pdf_import_callback, pattern=r"^pdfimport:"))
     application.add_handler(CallbackQueryHandler(callbacks.settings_callback, pattern=r"^settings:"))
 
