@@ -45,6 +45,7 @@ BOT_COMMANDS = [
     BotCommand("events", "Browse your events"),
     BotCommand("new", "Quickly add a task, reminder, or note"),
     BotCommand("help", "What Kangani can do"),
+    BotCommand("manual", "The full user manual"),
     BotCommand("settings", "View your current settings"),
 ]
 
@@ -202,6 +203,7 @@ def main() -> None:
     application.add_handler(CommandHandler("new", flows.add_menu_command))
     application.add_handler(CommandHandler("menu", commands.menu_command))
     application.add_handler(CommandHandler("help", commands.help_command))
+    application.add_handler(CommandHandler("manual", commands.manual_command))
     application.add_handler(CommandHandler("settings", commands.settings_command))
 
     # PDF uploads (schedule import) -- registered before the catch-all text
@@ -232,6 +234,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(flows.flow_callback, pattern=r"^flow:"))
     application.add_handler(CallbackQueryHandler(callbacks.pdf_import_callback, pattern=r"^pdfimport:"))
     application.add_handler(CallbackQueryHandler(callbacks.settings_callback, pattern=r"^settings:"))
+    application.add_handler(CallbackQueryHandler(callbacks.manual_callback, pattern=r"^manual:"))
 
     application.add_error_handler(error_handler)
 

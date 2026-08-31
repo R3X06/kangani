@@ -13,6 +13,7 @@ import calendar
 import html
 import os
 from datetime import date, datetime, time, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardMarkup, Update
@@ -534,6 +535,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"{keyboards.ADD_LABEL} / /new -- quick-add a task, reminder, or note by "
         "tapping through buttons (no typing needed except the title/content)\n"
         "/menu -- show the menu again\n"
+        "/manual -- the full user manual, section by section\n"
         "/settings -- view and change settings\n\n"
         "CAPTURE -- just tell me:\n"
         "\"add a task to finish the report by Friday\"\n"
@@ -664,3 +666,100 @@ async def dispatch_text_shortcut(update: Update, context: ContextTypes.DEFAULT_T
         return False
     await handler(update, context)
     return True
+
+# --- user manual ------------------------------------------------------------
+
+# Resolved against THIS file's directory, not the process CWD -- the same trap
+# that made the Jinja template loader fail when the bot was launched from
+# anywhere other than the repo root.
+_MANUAL_PATH = Path(__file__).parent / "Kangani_user_manual.md"
+
+# Written for the repo, not for chat: a section of notes-to-self about the bot
+# bio has no business in the in-app manual.
+_MANUAL_SKIP = {"what to put in the bot bio"}
+
+_MANUAL_CACHE: list[tuple[str, str]] | None = None
+
+
+def _plainify(md: str) -> str:
+    """Markdown -> something readable as a plain Telegram message.
+
+    Telegram renders neither Markdown tables nor blockquotes in plain mode, so
+    table rows collapse to dash-separated lines and the decorative syntax is
+    stripped rather than shown raw.
+    """
+    out = []
+    for line in md.split("\n"):
+        s = line.rstrip()
+        if s.strip().startswith("---") and set(s.strip()) <= {"-"}:
+            continue
+        if s.lstrip().startswith("|"):
+            cells = [c.strip() for c in s.strip().strip("|").split("|")]
+            if all(set(c) <= {"-", ":"} and c for c in cells):
+                continue  # table separator row
+            s = " — ".join(c for c in cells if c)
+        s = s.replace("**", "").replace("`", "")
+        if s.lstrip().startswith("> "):
+            s = s.lstrip()[2:]
+        out.append(s)
+    text = "\n".join(out)
+    while "\n\n\n" in text:
+        text = text.replace("\n\n\n", "\n\n")
+    return text.strip()
+
+
+def load_manual_sections() -> list[tuple[str, str]]:
+    """Parse the manual into (title, body) pairs, once per process."""
+    global _MANUAL_CACHE
+    if _MANUAL_CACHE is not None:
+        return _MANUAL_CACHE
+    try:
+        raw = _MANUAL_PATH.read_text(encoding="utf-8")
+    except OSError:
+        _MANUAL_CACHE = []
+        return _MANUAL_CACHE
+
+    sections: list[tuple[str, list[str]]] = []
+    for line in raw.split("\n"):
+        if line.startswith("## "):
+            sections.append((line[3:].strip(), []))
+        elif sections:
+            sections[-1][1].append(line)
+
+    _MANUAL_CACHE = [
+        (title, _plainify("\n".join(body)))
+        for title, body in sections
+        if title.casefold() not in _MANUAL_SKIP
+    ]
+    return _MANUAL_CACHE
+
+
+def build_manual_root_view() -> tuple[str, InlineKeyboardMarkup | None]:
+    sections = load_manual_sections()
+    if not sections:
+        return (
+            "The manual isn't available right now. /help has the short version.",
+            None,
+        )
+    return (
+        "Kangani — user manual. Pick a section:",
+        keyboards.manual_root_keyboard([t for t, _ in sections]),
+    )
+
+
+def build_manual_section_view(index: int) -> tuple[str, InlineKeyboardMarkup | None]:
+    sections = load_manual_sections()
+    if not 0 <= index < len(sections):
+        return build_manual_root_view()
+    title, body = sections[index]
+    text = f"{title}\n\n{body}"
+    # Telegram hard-caps a message at 4096 characters; truncate on a line
+    # boundary rather than letting the send fail outright.
+    if len(text) > 3900:
+        text = text[:3900].rsplit("\n", 1)[0] + "\n\n[...] See the full manual in the repo."
+    return text, keyboards.manual_section_keyboard()
+
+
+async def manual_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text, kb = build_manual_root_view()
+    await update.message.reply_text(text, reply_markup=kb)

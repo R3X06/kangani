@@ -21,6 +21,25 @@ NAV_LABELS = frozenset(
      EVENTS_LABEL, ADD_LABEL}
 )
 
+# Words that back out of ANY pending prompt. Every pending-reply interceptor
+# (pdf import, file upload, topic edit, quick-add flows) checks this first, so
+# there is always a way out by typing. Without it a prompt that only accepts
+# one kind of answer traps the conversation: replying "Cancel" to the PDF
+# import's root question just came back as "No topic found named 'Cancel'",
+# over and over, with no way to escape short of answering it.
+CANCEL_WORDS = frozenset({
+    "cancel", "cancel it", "cancel that", "cancel import", "nvm", "nevermind",
+    "never mind", "forget it", "stop", "abort", "quit", "exit", "go back",
+})
+
+
+def is_cancel_reply(text: str | None) -> bool:
+    """True if a reply to a pending prompt means "back out"."""
+    if not text:
+        return False
+    return text.strip().strip(".!/").casefold() in CANCEL_WORDS
+
+
 # 2-letter codes used in callback_data (e.g. "task:status:42:ip") instead of
 # the full enum string, keeping payloads compact and decoding centralized.
 STATUS_CODES = {
@@ -457,4 +476,17 @@ def flow_reference_keyboard() -> InlineKeyboardMarkup:
             ],
             [InlineKeyboardButton("❌ Cancel", callback_data="flow:cancel")],
         ]
+    )
+
+def manual_root_keyboard(titles: list[str]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(t, callback_data=f"manual:sec:{i}")]
+        for i, t in enumerate(titles)
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def manual_section_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⬅️ Contents", callback_data="manual:root")]]
     )

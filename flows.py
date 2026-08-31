@@ -346,6 +346,11 @@ async def handle_flow_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     text = (update.message.text or "").strip()
     awaiting = state["awaiting"]
 
+    if keyboards.is_cancel_reply(text):
+        _clear_state(context)
+        await update.message.reply_text("Cancelled — nothing was saved.")
+        return True
+
     if not text:
         await update.message.reply_text("That was empty -- try again, or tap ❌ Cancel above.")
         return True

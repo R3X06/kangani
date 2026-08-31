@@ -287,14 +287,28 @@ async def topic_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             # reach context.chat_data). Mirrors the pdf-import / file-upload
             # pending-reply pattern.
             topic_id = int(parts[2])
+            topic = database.get_topic(chat_id, topic_id)
+            if topic is None:
+                await query.answer("That topic no longer exists.", show_alert=True)
+                return
+            # Name the topic in the prompt. There is only ONE pending slot, so
+            # opening a second prompt silently replaces the first -- with an
+            # anonymous "this topic" the user had no way to tell which screen
+            # their reply would land on, and nicknames ended up on the wrong
+            # topic. The name also makes a stale prompt obvious.
+            name = topic["name"]
             prompts = {
-                "rename": "Reply with the new name for this topic.",
-                "nick": "Reply with a nickname for this topic (e.g. Y1, DSA).",
-                "addsub": "Reply with the name of the new subtopic to create here.",
+                "rename": f"Reply with the new name for '{name}'.",
+                "nick": f"Reply with a nickname for '{name}' (e.g. Y1, DSA).",
+                "addsub": f"Reply with the name of the new subtopic to create under '{name}'.",
             }
-            context.chat_data["topic_edit_awaiting"] = {"action": action, "topic_id": topic_id}
+            context.chat_data["topic_edit_awaiting"] = {
+                "action": action, "topic_id": topic_id, "topic_name": name,
+            }
             await query.answer()
-            await query.message.reply_text(prompts[action])
+            await query.message.reply_text(
+                f"{prompts[action]}\n(or reply \"cancel\" to back out)"
+            )
             return
         else:
             await query.answer()
@@ -321,21 +335,26 @@ async def handle_topic_edit_reply(update: Update, context: ContextTypes.DEFAULT_
     action = awaiting["action"]
     context.chat_data.pop("topic_edit_awaiting", None)
 
+    if keyboards.is_cancel_reply(text):
+        await update.message.reply_text("Cancelled — nothing changed.")
+        return True
+
     if not text:
         await update.message.reply_text("That was empty — nothing changed.")
         return True
     try:
+        was = awaiting.get("topic_name") or "that topic"
         if action == "rename":
             database.set_topic_names(chat_id, topic_id, name=text)
-            msg = f"Renamed to '{text}'."
+            msg = f"Renamed '{was}' to '{text}'."
         elif action == "nick":
             database.set_topic_names(chat_id, topic_id, nickname=text)
-            msg = f"Nicknamed '{text}'."
+            msg = f"Nicknamed '{was}' as '{text}'."
         else:  # addsub
             child = database.get_or_create_topic(
                 chat_id, text, parent_topic_id=topic_id
             )
-            msg = f"Created subtopic '{child['name']}'."
+            msg = f"Created subtopic '{child['name']}' under '{was}'."
     except ValueError as exc:
         await update.message.reply_text(str(exc))
         return True
@@ -568,6 +587,23 @@ async def event_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await query.answer()
             return
 
+        await query.edit_message_text(text, reply_markup=kb)
+        await query.answer()
+    except (IndexError, ValueError, KeyError):
+        await query.answer("Something went wrong with that button.", show_alert=True)
+
+async def manual_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    try:
+        parts = query.data.split(":")
+        action = parts[1]
+        if action == "root":
+            text, kb = commands.build_manual_root_view()
+        elif action == "sec":
+            text, kb = commands.build_manual_section_view(int(parts[2]))
+        else:
+            await query.answer()
+            return
         await query.edit_message_text(text, reply_markup=kb)
         await query.answer()
     except (IndexError, ValueError, KeyError):

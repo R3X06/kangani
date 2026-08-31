@@ -536,6 +536,15 @@ async def handle_pdf_import_reply(update: Update, context: ContextTypes.DEFAULT_
     chat_id = update.effective_chat.id
     text = (update.message.text or "").strip()
     import_id = awaiting["import_id"]
+
+    # An escape hatch BEFORE any name matching. The root question only accepts
+    # a topic name or "root", so without this "Cancel" was just another failed
+    # name lookup and the prompt re-asked forever.
+    if keyboards.is_cancel_reply(text):
+        context.chat_data.pop("pdf_import_awaiting", None)
+        context.chat_data.get("pending_pdf_import", {}).pop(import_id, None)
+        await update.message.reply_text("Import cancelled — nothing was saved.")
+        return True
     result = context.chat_data.get("pending_pdf_import", {}).get(import_id)
     if result is None:
         context.chat_data.pop("pdf_import_awaiting", None)

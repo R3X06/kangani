@@ -113,6 +113,15 @@ async def handle_file_upload_reply(
     if not pending:
         return False
 
+    if keyboards.is_cancel_reply(update.message.text):
+        context.chat_data.pop("file_upload_pending", None)
+        context.chat_data.pop("file_upload_pending_pick", None)
+        await update.message.reply_text(
+            "Okay — the file is saved but not filed under a topic. "
+            "Tell me where it belongs any time."
+        )
+        return True
+
     chat_id = update.effective_chat.id
     text = (update.message.text or "").strip()
 
