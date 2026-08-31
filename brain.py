@@ -14,10 +14,22 @@ import tools
 logger = logging.getLogger(__name__)
 
 MODEL = "claude-sonnet-5"
-MAX_TOKENS = 2048
+# 2048 was too tight: a bulk request ("10 min before every lesson for 3 weeks")
+# emits dozens of create_reminder blocks in one round, and the response was
+# being cut off mid-JSON -- stop_reason came back "max_tokens", the loop fell
+# out with no text block, and the user got the generic "couldn't come up with
+# a response" while zero reminders had actually been created.
+MAX_TOKENS = 8192
 MAX_TOOL_ITERATIONS = 10  # combined calendars can chain topic-lookup +
 # query_schedule + query_tasks + query_notes + query_reminders in one turn
-HISTORY_LIMIT = 20  # ~10 turns, trimmed after each response
+# A truncated turn is retried with a smaller-batches nudge rather than
+# surfaced as a failure -- but only so many times, so a genuinely impossible
+# request can't spin.
+MAX_TRUNCATION_RETRIES = 2
+# Counted in raw message entries, not turns -- one user turn can now expand
+# into several (assistant tool_use -> user tool_result -> ... -> assistant
+# text), all of which are kept so a follow-up knows what already happened.
+HISTORY_LIMIT = 40
 
 _client: AsyncAnthropic | None = None
 
@@ -38,21 +50,18 @@ def _get_client() -> AsyncAnthropic:
     return get_client()
 
 
-def build_system_prompt(chat_id: int) -> str:
-    tz_name = os.environ.get("TIMEZONE", "UTC")
-    now_local = datetime.now(ZoneInfo(tz_name))
-    now_utc = now_local.astimezone(timezone.utc)
-    local_str = now_local.strftime("%Y-%m-%dT%H:%M:%S%z") + f" ({now_local.strftime('%A')})"
-    utc_str = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+_CACHE = {"type": "ephemeral"}
 
-    return f"""You are Kangani, a personal assistant running inside Telegram. \
+# The system prompt is split in two so the large guidance block is byte-for-byte
+# identical on every request and can sit behind a cache breakpoint. A single
+# interpolated character anywhere inside it -- the clock, say -- would change
+# the prefix and invalidate the cache on every call, which is why the date/time
+# anchors and the offset example derived from them live in a separate trailing
+# block instead of near the top where they used to be.
+_STATIC_SYSTEM = """You are Kangani, a personal assistant running inside Telegram. \
 You help the user manage a unified tree of topics (courses, modules, events, \
 life areas) and the tasks, notes, reminders, and timetable lessons attached \
 to them.
-
-Current date/time:
-- Local ({tz_name}): {local_str}
-- UTC: {utc_str}
 
 Use the available tools whenever the user's request involves creating, \
 updating, or querying tasks, modules, topics, notes, schedule blocks, \
@@ -201,7 +210,7 @@ specific_date, start_time, and end_time for schedule blocks are plain local \
 calendar/clock values, not absolute instants -- do NOT attach a UTC offset \
 or convert timezones for them the way you do for deadline/trigger_datetime. \
 When the user asks "what's on this week", treat "this week" as the \
-Monday-Sunday calendar week containing the current local date above, unless \
+Monday-Sunday calendar week containing the current local date given at the end of this prompt, unless \
 they explicitly ask for something else (e.g. "the next 7 days"). Before \
 calling delete_schedule_block, call query_schedule first to find the \
 correct schedule_block_id -- never guess it.
@@ -288,6 +297,21 @@ show them in normal listings. Only pass show_tags=true when the user \
 explicitly asks to see tags (e.g. "notes -tag", "show tags", "with tags"). \
 The tag is how the user can refer to one specific item unambiguously later.
 
+Reminders for lessons are a BULK operation: use add_lesson_reminders, never a loop of create_reminder. A request like "10 minutes before every lesson in Y3S1 for the next 3 weeks" is dozens or hundreds of reminders, and issuing them one at a time runs out of room part-way through -- leaving the user with some of them and a message claiming all of them were set. add_lesson_reminders expands the timetable itself, honours each lesson's week pattern and the chat's recess weeks, skips occurrences already in the past, and skips exact duplicates, so it is safe to retry. For any range longer than about a week, call it with dry_run=true first, tell the user the resulting count, and wait for them to confirm before the real call. create_reminder remains the right tool for a genuine one-off.
+
+Never tell the user something was created, updated, or deleted unless a tool result in this turn actually says so. If a tool failed, returned fewer items than expected, or you ran out of tool calls before finishing, say exactly that and say what did land -- report the number the tool reported, not the number the user asked for. A confident but wrong confirmation is far worse than admitting a partial result, because the user only finds out when the reminder never arrives.
+
+When something is rescheduled or called off, deal with the reminders that were tied to the old time -- reschedule_reminder to move one, cancel_reminder to drop it. Leaving them in place means the user gets pinged for something that isn't happening. Deleting is for things that shouldn't exist at all; a finished task is update_task_status with status='done', not delete_task. delete_topic takes a whole subtree with it, so run it once without confirm, read the counts back to the user, and wait for a clear yes.
+
+Reply in plain text only -- no Markdown formatting."""
+
+
+def _dynamic_system(tz_name: str, local_str: str, utc_str: str, now_local) -> str:
+    """The per-request tail: never cached, deliberately small."""
+    return f"""Current date/time:
+- Local ({tz_name}): {local_str}
+- UTC: {utc_str}
+
 When resolving relative dates and times (e.g. "tomorrow", "next Friday", \
 "in 2 minutes") for deadlines or reminders, compute the target moment using \
 whichever of the two anchors above is more natural for the arithmetic \
@@ -301,25 +325,249 @@ offset to match -- the digits and the offset must describe the same \
 absolute instant. You do not need to manually subtract the UTC offset \
 yourself if you use the local anchor -- just attach the local offset shown \
 above to your computed local time.
+"""
 
-Reply in plain text only -- no Markdown formatting."""
+
+def _clock() -> tuple[str, str, str, "datetime"]:
+    tz_name = os.environ.get("TIMEZONE", "UTC")
+    now_local = datetime.now(ZoneInfo(tz_name))
+    now_utc = now_local.astimezone(timezone.utc)
+    local_str = (
+        now_local.strftime("%Y-%m-%dT%H:%M:%S%z")
+        + f" ({now_local.strftime('%A')})"
+    )
+    utc_str = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return tz_name, local_str, utc_str, now_local
+
+
+def build_system_blocks(chat_id: int, extra: str | None = None) -> list[dict]:
+    """System prompt as cacheable blocks.
+
+    Order matters: the static block must come FIRST, since a cache breakpoint
+    covers everything before it. `extra` (used by the out-of-tool-calls
+    synthesis pass) is appended as its own block rather than string-concatenated
+    onto the prompt, so that pass still reads the same cached prefix.
+    """
+    tz_name, local_str, utc_str, now_local = _clock()
+    blocks = [
+        {"type": "text", "text": _STATIC_SYSTEM, "cache_control": _CACHE},
+        {"type": "text", "text": _dynamic_system(tz_name, local_str, utc_str, now_local)},
+    ]
+    if extra:
+        blocks.append({"type": "text", "text": extra})
+    return blocks
+
+
+def build_system_prompt(chat_id: int) -> str:
+    """Flat-string form of the same prompt, for callers that aren't the
+    tool loop (and for eyeballing what Claude actually sees)."""
+    return "\n\n".join(b["text"] for b in build_system_blocks(chat_id))
+
+
+
+_TRUNCATION_NUDGE = (
+    "Your previous reply was cut off because it exceeded the length limit, so "
+    "NONE of the tool calls in it ran -- nothing was saved. Try again, but "
+    "issue at most 8 tool calls in this round and stop; you will get further "
+    "rounds to finish the rest. If the request needs far more calls than that, "
+    "say so plainly and propose a narrower scope instead of attempting it."
+)
+
+_OVER_BUDGET_REPLY = (
+    "That request needs more work than I can fit into one go, so I've stopped "
+    "rather than half-doing it -- nothing was saved. Try narrowing it (a "
+    "single week, or one module at a time) and I'll take it from there."
+)
+
+
+def _blocks_to_dicts(content) -> list[dict]:
+    """Convert an SDK response's content blocks into plain JSON-safe dicts.
+
+    Needed because these turns are now kept in `history` (which lives in
+    PTB's chat_data) and replayed on later requests -- storing SDK objects
+    there would couple the stored history to one anthropic version. Unknown
+    block types are dropped rather than guessed at.
+    """
+    out: list[dict] = []
+    for block in content:
+        if block.type == "text":
+            if block.text:
+                out.append({"type": "text", "text": block.text})
+        elif block.type == "tool_use":
+            out.append(
+                {
+                    "type": "tool_use",
+                    "id": block.id,
+                    "name": block.name,
+                    "input": block.input,
+                }
+            )
+    return out
+
+
+def _is_plain_user_turn(entry: dict) -> bool:
+    return entry.get("role") == "user" and isinstance(entry.get("content"), str)
+
+
+def _trim_history(history: list) -> None:
+    """Trim to HISTORY_LIMIT entries WITHOUT orphaning a tool_result.
+
+    A blunt `del history[:-N]` can now slice into the middle of a tool round
+    and leave the list starting with a user turn full of tool_result blocks
+    whose matching tool_use is gone -- the API rejects that outright. So after
+    the length trim, drop from the front until the history starts on an
+    ordinary text user turn again.
+    """
+    if len(history) > HISTORY_LIMIT:
+        del history[: len(history) - HISTORY_LIMIT]
+    while history and not _is_plain_user_turn(history[0]):
+        del history[0]
+
+
+def _mark_block(entry: dict) -> dict | None:
+    """Copy a message with a cache breakpoint on its last content block.
+
+    Empty content can't be cached, so those are left alone. Works on a copy
+    so `history` keeps storing plain strings and never carries cache_control.
+    """
+    out = dict(entry)
+    content = out["content"]
+    content = (
+        [{"type": "text", "text": content}]
+        if isinstance(content, str)
+        else [dict(b) for b in content]
+    )
+    if not content or not (content[-1].get("text", "x") or "").strip():
+        return None
+    content[-1] = {**content[-1], "cache_control": _CACHE}
+    out["content"] = content
+    return out
+
+
+def _cache_messages(messages: list, turn_start: int) -> list:
+    """Two message-level breakpoints: a fixed anchor plus a rolling one.
+
+    The rolling breakpoint on the final message is what makes a multi-round
+    turn cheap -- round N writes the prefix, round N+1 reads it and pays a
+    write only on the delta.
+
+    The anchor on this turn's incoming user message exists because of the
+    20-block lookback limit. The lookback counts BLOCKS, not messages, and a
+    bulk round can emit 8 tool_use blocks answered by 8 tool_result blocks --
+    16 blocks in a single round. Two such rounds push the rolling breakpoint
+    past the previous write's lookback window and the hit is lost. The anchor
+    sits at a position that never moves for the whole turn, so a write
+    accumulates there on round one and every later round can still fall back
+    to it.
+
+    Together with the tools and static-system breakpoints this uses all 4
+    available slots.
+    """
+    if not messages:
+        return messages
+    out = list(messages)
+    for idx in {turn_start, len(out) - 1}:
+        if 0 <= idx < len(out):
+            marked = _mark_block(out[idx])
+            if marked is not None:
+                out[idx] = marked
+    return out
+
+
+def _log_cache_usage(chat_id: int, calls: int, usage: dict) -> None:
+    total = usage["write"] + usage["read"] + usage["fresh"]
+    if not total:
+        return
+    logger.info(
+        "chat %s: %d API call(s), input tokens -- cache read %d, cache write "
+        "%d, uncached %d (%.0f%% served from cache)",
+        chat_id, calls, usage["read"], usage["write"], usage["fresh"],
+        100 * usage["read"] / total,
+    )
 
 
 async def get_response(chat_id: int, user_text: str, history: list, job_queue) -> str:
     messages = history + [{"role": "user", "content": user_text}]
-    system_prompt = build_system_prompt(chat_id)
+    # Index of this turn's incoming user message -- fixed for the whole turn,
+    # so it works as a stable cache anchor as the tool rounds pile up.
+    turn_start = len(history)
+    system_blocks = build_system_blocks(chat_id)
+    usage = {"read": 0, "write": 0, "fresh": 0}
+    calls = 0
+
+    def _account(resp) -> None:
+        u = getattr(resp, "usage", None)
+        if u is None:
+            return
+        usage["read"] += getattr(u, "cache_read_input_tokens", 0) or 0
+        usage["write"] += getattr(u, "cache_creation_input_tokens", 0) or 0
+        usage["fresh"] += getattr(u, "input_tokens", 0) or 0
+
+    def _commit(final_text: str, keep_tool_turns: bool = True) -> str:
+        """Fold this turn into `history` and return the reply.
+
+        The whole turn is kept -- assistant tool_use rounds and their
+        tool_result replies included -- not just the final text. Without
+        those, a follow-up like "did that work?" has no record that 12 of 34
+        reminders already got created, which is exactly how Kangani ended up
+        confidently reporting reminders that never existed.
+        """
+        if keep_tool_turns:
+            history.extend(messages[len(history):])
+            # Every stored turn must end on an assistant reply. It won't when
+            # the loop exited via the ceiling path, whose synthesis response
+            # is deliberately never appended to `messages` (it's a one-off
+            # call made with no tools).
+            if not history or history[-1].get("role") != "assistant":
+                history.append({"role": "assistant", "content": final_text})
+        else:
+            history.append({"role": "user", "content": user_text})
+            history.append({"role": "assistant", "content": final_text})
+        _trim_history(history)
+        _log_cache_usage(chat_id, calls, usage)
+        return final_text
 
     response = None
     hit_ceiling = True
+    truncations = 0
     for _ in range(MAX_TOOL_ITERATIONS):
         response = await _get_client().messages.create(
             model=MODEL,
             max_tokens=MAX_TOKENS,
-            system=system_prompt,
-            tools=tools.TOOL_SCHEMAS,
-            messages=messages,
+            system=system_blocks,
+            tools=tools.TOOL_SCHEMAS_CACHED,
+            messages=_cache_messages(messages, turn_start),
         )
-        messages.append({"role": "assistant", "content": response.content})
+        calls += 1
+        _account(response)
+        if response.stop_reason == "max_tokens":
+            # The turn was cut off mid-generation, so its trailing tool_use
+            # block has incomplete JSON input and MUST NOT be executed -- and
+            # the turn as a whole can't be appended either, since an
+            # unanswered tool_use poisons every later request. Drop it whole
+            # and retry with an explicit smaller-batches instruction.
+            truncations += 1
+            logger.warning(
+                "Response truncated at max_tokens for chat %s (attempt %d)",
+                chat_id, truncations,
+            )
+            if truncations > MAX_TRUNCATION_RETRIES:
+                return _commit(_OVER_BUDGET_REPLY, keep_tool_turns=False)
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "(reply cut off)"}],
+                }
+            )
+            messages.append({"role": "user", "content": _TRUNCATION_NUDGE})
+            continue
+
+        # An empty content list is rejected by the API on the next request,
+        # so never store one.
+        blocks = _blocks_to_dicts(response.content) or [
+            {"type": "text", "text": "(no content)"}
+        ]
+        messages.append({"role": "assistant", "content": blocks})
 
         if response.stop_reason != "tool_use":
             hit_ceiling = False
@@ -356,20 +604,22 @@ async def get_response(chat_id: int, user_text: str, history: list, job_queue) -
         response = await _get_client().messages.create(
             model=MODEL,
             max_tokens=MAX_TOKENS,
-            system=system_prompt
-            + "\n\nYou are out of tool calls for this turn. Answer using ONLY "
-            "the tool results already gathered above -- do not claim to call "
-            "any more tools. If something is still missing, say so briefly "
-            "rather than guessing.",
-            messages=messages,
+            system=build_system_blocks(
+                chat_id,
+                extra=(
+                    "You are out of tool calls for this turn. Answer using "
+                    "ONLY the tool results already gathered above -- do not "
+                    "claim to call any more tools. If something is still "
+                    "missing, say so briefly rather than guessing."
+                ),
+            ),
+            messages=_cache_messages(messages, turn_start),
         )
+        calls += 1
+        _account(response)
 
     final_text = next(
         (b.text for b in response.content if b.type == "text"), ""
     ) or "Sorry, I couldn't come up with a response for that -- try rephrasing."
 
-    history.append({"role": "user", "content": user_text})
-    history.append({"role": "assistant", "content": final_text})
-    del history[:-HISTORY_LIMIT]
-
-    return final_text
+    return _commit(final_text)

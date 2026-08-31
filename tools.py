@@ -2,7 +2,7 @@
 
 import logging
 import os
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time as dtime, timedelta, timezone
 from typing import Callable
 from zoneinfo import ZoneInfo
 
@@ -151,6 +151,83 @@ TOOL_SCHEMAS = [
         },
     },
     {
+        "name": "add_lesson_reminders",
+        "description": (
+            "Create reminders in BULK for every lesson occurrence in a date "
+            "range, in ONE call -- e.g. '10 minutes before every lesson in "
+            "Y3S1 for the next 3 weeks'. Never loop create_reminder for this: "
+            "one lesson-reminder request can be hundreds of reminders and "
+            "issuing them one at a time will run out of room and silently "
+            "create only some of them. Occurrences are expanded server-side "
+            "from the timetable, honouring each lesson's week pattern and the "
+            "chat's recess weeks, so you do not need to work out which dates a "
+            "class actually runs. Reminders already in the past are skipped, "
+            "and exact duplicates of existing pending reminders are skipped "
+            "too, so re-running a request is safe. Each reminder is linked to "
+            "its lesson's topic, so they show up under that topic later. "
+            "ALWAYS call with dry_run=true first when the range is longer than "
+            "about a week: that reports how many would be created without "
+            "creating anything, so you can tell the user the scale and confirm."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {
+                    "type": "string",
+                    "description": (
+                        "ISO-8601 date YYYY-MM-DD, inclusive. Compute from the "
+                        "current date in the system prompt (e.g. '3 weeks from "
+                        "today' starts today)."
+                    ),
+                },
+                "date_to": {
+                    "type": "string",
+                    "description": "ISO-8601 date YYYY-MM-DD, inclusive.",
+                },
+                "minutes_before": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": (
+                        "One entry per reminder wanted per lesson. [10] is the "
+                        "default; [20, 10, 5] gives three reminders before "
+                        "every lesson. Each entry multiplies the total, so "
+                        "check the count with dry_run first."
+                    ),
+                },
+                "topic_id": {
+                    "type": "integer",
+                    "description": (
+                        "Restrict to lessons under this topic and everything "
+                        "nested beneath it -- this is how 'every lesson in "
+                        "Y3S1' works. Look it up via list_topics. Omit to "
+                        "cover every lesson in the chat."
+                    ),
+                },
+                "include_subtopics": {
+                    "type": "boolean",
+                    "description": "Default true. false restricts to the exact topic.",
+                },
+                "lesson_types": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional -- only these lesson types, e.g. ['Tutorial', "
+                        "'Lab']. Check the exact spellings with "
+                        "list_lesson_types first."
+                    ),
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": (
+                        "Default false. true reports the count and a breakdown "
+                        "WITHOUT creating anything."
+                    ),
+                },
+            },
+            "required": ["date_from", "date_to"],
+        },
+    },
+    {
         "name": "create_reminder",
         "description": (
             "Schedule a one-time reminder message to be sent at a specific "
@@ -188,6 +265,105 @@ TOOL_SCHEMAS = [
                 },
             },
             "required": ["trigger_datetime", "message"],
+        },
+    },
+    {
+        "name": "cancel_reminder",
+        "description": (
+            "Cancel a pending reminder so it never fires. Use this whenever "
+            "something is called off or moved -- if an event's time changed, "
+            "cancel the reminders tied to the old time rather than leaving "
+            "them to go off. Find the reminder_id with query_reminders first; "
+            "never guess it. Cancelling keeps the record (status becomes "
+            "cancelled) and removes it from the pending list; to move a "
+            "reminder to a different time instead, use reschedule_reminder, "
+            "which keeps it as one reminder rather than a cancelled one plus a "
+            "new one."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"reminder_id": {"type": "integer"}},
+            "required": ["reminder_id"],
+        },
+    },
+    {
+        "name": "reschedule_reminder",
+        "description": (
+            "Move a pending reminder to a different time, in place. Prefer "
+            "this over cancelling and re-creating, so the user sees one "
+            "reminder rather than two. Look the reminder_id up via "
+            "query_reminders first. Only works while the reminder is still "
+            "pending -- a reminder that already fired can't be moved, create a "
+            "new one instead."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reminder_id": {"type": "integer"},
+                "new_trigger_datetime": {
+                    "type": "string",
+                    "description": (
+                        "ISO-8601 datetime WITH AN EXPLICIT OFFSET, e.g. "
+                        "2026-09-04T15:30:00+08:00. Must be in the future."
+                    ),
+                },
+            },
+            "required": ["reminder_id", "new_trigger_datetime"],
+        },
+    },
+    {
+        "name": "delete_task",
+        "description": (
+            "Permanently delete a task. Only for a task that shouldn't exist "
+            "at all (a mistake, a duplicate) -- when the user has simply "
+            "finished something, use update_task_status with status='done' "
+            "instead, which keeps the record. Look the task_id up via "
+            "query_tasks first; never guess it. Any pending reminders linked "
+            "to the task go with it."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"task_id": {"type": "integer"}},
+            "required": ["task_id"],
+        },
+    },
+    {
+        "name": "delete_note",
+        "description": (
+            "Permanently delete a note. Look the note_id up via query_notes "
+            "first; never guess it."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"note_id": {"type": "integer"}},
+            "required": ["note_id"],
+        },
+    },
+    {
+        "name": "delete_topic",
+        "description": (
+            "Permanently delete a topic AND everything nested underneath it -- "
+            "every subtopic, and all the tasks, notes, lessons, files and "
+            "reminders attached to any of them. Deleting a semester topic "
+            "removes that whole semester. Because of that, ALWAYS call once "
+            "with confirm=false first: nothing is deleted and you get an exact "
+            "count of what would go. Tell the user those numbers, wait for "
+            "them to agree, and only then call again with confirm=true. Look "
+            "the topic_id up via list_topics; never guess it."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "topic_id": {"type": "integer"},
+                "confirm": {
+                    "type": "boolean",
+                    "description": (
+                        "Default false, which only reports what would be "
+                        "deleted. true actually deletes."
+                    ),
+                },
+            },
+            "required": ["topic_id"],
         },
     },
     {
@@ -986,6 +1162,306 @@ def _handle_create_reminder(tool_input: dict, chat_id: int, job_queue) -> str:
     )
 
 
+_MAX_BULK_REMINDERS = 250
+
+
+def _lesson_reminder_text(occ: dict, label: str | None, minutes: int) -> str:
+    """Body of a lesson reminder.
+
+    Deliberately does NOT start with 'Reminder:' -- scheduler._fire_reminder
+    already prefixes that when sending, and messages that included it produced
+    the doubled 'Reminder: Reminder: ...' seen in earlier lesson reminders.
+    """
+    parts = [p for p in (label, occ.get("class_type")) if p]
+    what = " ".join(parts) if parts else "Lesson"
+    when = "starts now" if minutes == 0 else f"starts in {minutes} min"
+    location = f" at {occ['location']}" if occ.get("location") else ""
+    return f"{what} {when}{location}"
+
+
+def _handle_add_lesson_reminders(tool_input: dict, chat_id: int, job_queue) -> str:
+    date_from = tool_input["date_from"]
+    date_to = tool_input["date_to"]
+    dry_run = bool(tool_input.get("dry_run", False))
+
+    raw_offsets = tool_input.get("minutes_before") or [10]
+    offsets = sorted({int(m) for m in raw_offsets}, reverse=True)
+    if any(m < 0 for m in offsets):
+        raise ValueError("minutes_before entries must be zero or positive.")
+
+    d_from = date.fromisoformat(date_from)
+    d_to = date.fromisoformat(date_to)
+    if d_to < d_from:
+        raise ValueError("date_to must not be earlier than date_from.")
+    if (d_to - d_from).days > _MAX_SCHEDULE_QUERY_DAYS:
+        raise ValueError(
+            f"Range too large -- at most {_MAX_SCHEDULE_QUERY_DAYS} days per call."
+        )
+
+    blocks = database.list_schedule_blocks(
+        chat_id=chat_id,
+        date_from=date_from,
+        date_to=date_to,
+        topic_id=tool_input.get("topic_id"),
+        include_subtopics=tool_input.get("include_subtopics", True),
+        class_types=tool_input.get("lesson_types"),
+    )
+    anchor = database.get_semester_anchor(chat_id)
+    anchor_date = date.fromisoformat(anchor) if anchor else None
+    try:
+        occurrences = scheduler.expand_occurrences(
+            blocks, date_from, date_to, anchor_date,
+            frozenset(database.get_recess_weeks(chat_id)),
+        )
+    except scheduler.AnchorNotSetError:
+        return scheduler.ANCHOR_NOT_SET_MESSAGE
+    if not occurrences:
+        return "No lessons in that range, so there is nothing to remind about."
+
+    tz_name = os.environ.get("TIMEZONE", "UTC")
+    tz = ZoneInfo(tz_name)
+    label_format = database.get_timetable_label_format(chat_id)
+    now_utc = datetime.now(timezone.utc)
+
+    # Re-running the same request must not double up. Existing pending
+    # reminders are keyed on (exact trigger, exact message) -- the same pair a
+    # repeat of this request would generate.
+    existing = {
+        (r["trigger_data"], r["message"])
+        for r in database.list_pending_reminders(chat_id)
+    }
+
+    planned: list[dict] = []
+    skipped_past = 0
+    skipped_dupe = 0
+    for occ in occurrences:
+        label = database.resolve_label(occ, label_format)
+        start_local = datetime.combine(
+            date.fromisoformat(occ["occurrence_date"]),
+            dtime.fromisoformat(occ["start_time"]),
+            tzinfo=tz,
+        )
+        for minutes in offsets:
+            trigger_dt = (start_local - timedelta(minutes=minutes)).astimezone(
+                timezone.utc
+            )
+            if trigger_dt <= now_utc:
+                skipped_past += 1
+                continue
+            message = _lesson_reminder_text(occ, label, minutes)
+            key = (scheduler.format_utc_iso(trigger_dt), message)
+            if key in existing:
+                skipped_dupe += 1
+                continue
+            existing.add(key)  # guards against duplicates within this batch too
+            planned.append(
+                {
+                    "trigger_dt": trigger_dt,
+                    "trigger_str": key[0],
+                    "message": message,
+                    "topic_id": occ.get("topic_id"),
+                    "label": label or "Unlabelled",
+                }
+            )
+
+    tail = ""
+    if skipped_past:
+        tail += f" Skipped {skipped_past} already in the past."
+    if skipped_dupe:
+        tail += f" Skipped {skipped_dupe} that already exist."
+
+    if not planned:
+        return (
+            f"Nothing new to create for {date_from}..{date_to}.{tail}"
+            if tail
+            else f"Nothing to create for {date_from}..{date_to}."
+        )
+
+    per_label: dict[str, int] = {}
+    for p in planned:
+        per_label[p["label"]] = per_label.get(p["label"], 0) + 1
+    breakdown = ", ".join(
+        f"{name} {count}" for name, count in sorted(per_label.items())
+    )
+    offsets_str = "/".join(str(m) for m in offsets)
+
+    if len(planned) > _MAX_BULK_REMINDERS:
+        raise ValueError(
+            f"That would be {len(planned)} reminders ({len(occurrences)} lessons "
+            f"x {len(offsets)} lead times), over the {_MAX_BULK_REMINDERS} limit "
+            "for one call. Tell the user the scale and suggest a shorter range "
+            "or fewer lead times, then retry."
+        )
+
+    if dry_run:
+        return (
+            f"DRY RUN -- nothing created. Would create {len(planned)} reminders "
+            f"({len(occurrences)} lessons x {offsets_str} min before) across "
+            f"{date_from}..{date_to}. By module: {breakdown}.{tail} "
+            "Confirm the scale with the user, then call again with dry_run=false."
+        )
+
+    created = 0
+    failed = 0
+    for p in planned:
+        try:
+            reminder = database.create_reminder(
+                chat_id=chat_id,
+                trigger_datetime_utc=p["trigger_str"],
+                message=p["message"],
+                linked_topic_id=p["topic_id"],
+            )
+            scheduler.schedule_reminder(
+                job_queue, reminder["id"], chat_id, p["trigger_dt"], p["message"]
+            )
+            created += 1
+        except Exception:
+            # One bad row must not lose the rest of the batch -- and the count
+            # reported back has to be the number that actually landed, since a
+            # confident but wrong "all set" is exactly what made earlier lesson
+            # reminders silently go missing.
+            logger.exception("add_lesson_reminders: failed on %s", p["trigger_str"])
+            failed += 1
+
+    result = (
+        f"Created {created} reminders ({offsets_str} min before each lesson) "
+        f"across {date_from}..{date_to}. By module: {breakdown}.{tail}"
+    )
+    if failed:
+        result += f" WARNING: {failed} failed to save -- report this to the user."
+    return result
+
+
+def _pending_reminder_ids(chat_id: int) -> set[int]:
+    return {r["id"] for r in database.list_pending_reminders(chat_id)}
+
+
+def _drop_reminder_jobs(job_queue, reminder_ids) -> int:
+    """Unschedule the JobQueue jobs for reminders that no longer exist.
+
+    Deleting a task or topic cascades through the FKs and takes its reminder
+    rows with it, but the scheduled jobs live in JobQueue's memory, not the DB
+    -- left alone they still fire, sending a reminder about something that was
+    deleted. Callers snapshot the pending ids before the delete and pass the
+    difference here.
+    """
+    if job_queue is None:
+        return 0
+    dropped = 0
+    for reminder_id in reminder_ids:
+        for job in job_queue.get_jobs_by_name(f"reminder-{reminder_id}"):
+            job.schedule_removal()
+            dropped += 1
+    return dropped
+
+
+def _handle_cancel_reminder(tool_input: dict, chat_id: int, job_queue) -> str:
+    reminder_id = tool_input["reminder_id"]
+    reminder = database.cancel_reminder(chat_id, reminder_id)
+    if reminder is None:
+        raise ValueError(f"No reminder #{reminder_id} found for this chat.")
+    _drop_reminder_jobs(job_queue, [reminder_id])
+    return f"Cancelled reminder #{reminder_id}: '{reminder['message']}'."
+
+
+def _handle_reschedule_reminder(tool_input: dict, chat_id: int, job_queue) -> str:
+    reminder_id = tool_input["reminder_id"]
+    trigger_dt_utc = scheduler.parse_iso_datetime(tool_input["new_trigger_datetime"])
+    if trigger_dt_utc <= datetime.now(timezone.utc):
+        raise ValueError(
+            "That time is in the past -- pick a future time for the reminder."
+        )
+    trigger_utc_str = scheduler.format_utc_iso(trigger_dt_utc)
+
+    reminder = database.reschedule_reminder(chat_id, reminder_id, trigger_utc_str)
+    if reminder is None:
+        raise ValueError(
+            f"No PENDING reminder #{reminder_id} for this chat -- it may have "
+            "already fired or been cancelled. Create a new one instead."
+        )
+
+    # Replace the old job, not just add another: leaving it registered would
+    # fire the reminder at BOTH the old and new times.
+    _drop_reminder_jobs(job_queue, [reminder_id])
+    scheduler.schedule_reminder(
+        job_queue, reminder_id, chat_id, trigger_dt_utc, reminder["message"]
+    )
+
+    tz_name = os.environ.get("TIMEZONE", "UTC")
+    local_str = trigger_dt_utc.astimezone(ZoneInfo(tz_name)).strftime("%Y-%m-%d %H:%M %z")
+    return (
+        f"Moved reminder #{reminder_id} ('{reminder['message']}') to "
+        f"{local_str} ({tz_name})."
+    )
+
+
+def _handle_delete_task(tool_input: dict, chat_id: int, job_queue) -> str:
+    task_id = tool_input["task_id"]
+    task = database.get_task(chat_id, task_id)
+    if task is None:
+        raise ValueError(f"No task #{task_id} found for this chat.")
+
+    before = _pending_reminder_ids(chat_id)
+    if not database.delete_task(chat_id, task_id):
+        raise ValueError(f"No task #{task_id} found for this chat.")
+    orphaned = before - _pending_reminder_ids(chat_id)
+    _drop_reminder_jobs(job_queue, orphaned)
+
+    extra = f" Its {len(orphaned)} linked reminder(s) went with it." if orphaned else ""
+    return f"Deleted task #{task_id} '{task['title']}'.{extra}"
+
+
+def _handle_delete_note(tool_input: dict, chat_id: int, job_queue) -> str:
+    note_id = tool_input["note_id"]
+    if not database.delete_note(chat_id, note_id):
+        raise ValueError(f"No note #{note_id} found for this chat.")
+    return f"Deleted note #{note_id}."
+
+
+def _handle_delete_topic(tool_input: dict, chat_id: int, job_queue) -> str:
+    topic_id = tool_input["topic_id"]
+    topic = database.get_topic(chat_id, topic_id)
+    if topic is None:
+        raise ValueError(f"No topic #{topic_id} found for this chat.")
+
+    before = _pending_reminder_ids(chat_id)
+    reminder_count = len(
+        database.list_pending_reminders(chat_id, topic_id=topic_id)
+    )
+
+    if not tool_input.get("confirm", False):
+        counts = database.get_topic_counts(chat_id, topic_id)
+        # get_topic_counts reports DIRECT children only, but the delete
+        # cascades the whole subtree -- count that the same way delete_topic
+        # does, so the confirmation figure matches what actually goes.
+        conn = database.get_connection()
+        try:
+            subtree = len(database.get_topic_subtree_ids(conn, chat_id, topic_id))
+        finally:
+            conn.close()
+        return (
+            f"NOT DELETED -- confirmation needed. Deleting '{topic['name']}' "
+            f"would remove it and everything nested under it: {subtree} "
+            f"topic(s) in total, {counts['tasks']} task(s), "
+            f"{counts['notes']} note(s), {counts['lessons']} lesson(s), "
+            f"{counts['files']} file(s), {reminder_count} pending reminder(s). "
+            "Read these numbers back to the user, and only call again with "
+            "confirm=true once they agree."
+        )
+
+    result = database.delete_topic(chat_id, topic_id)
+    orphaned = before - _pending_reminder_ids(chat_id)
+    _drop_reminder_jobs(job_queue, orphaned)
+
+    c = result["counts"]
+    return (
+        f"Deleted '{result['name']}' and everything under it: "
+        f"{c['topics']} topic(s), {c['tasks']} task(s), {c['notes']} note(s), "
+        f"{c['lessons']} lesson(s), {c['files']} file(s), "
+        f"{len(orphaned)} pending reminder(s)."
+    )
+
+
 def _handle_list_topic_kinds(tool_input: dict, chat_id: int, job_queue) -> str:
     kinds = database.list_topic_kinds(chat_id)
     if not kinds:
@@ -1404,6 +1880,12 @@ TOOL_HANDLERS: dict[str, Callable[[dict, int, object], str]] = {
     "query_tasks": _handle_query_tasks,
     "update_task_status": _handle_update_task_status,
     "create_reminder": _handle_create_reminder,
+    "add_lesson_reminders": _handle_add_lesson_reminders,
+    "cancel_reminder": _handle_cancel_reminder,
+    "reschedule_reminder": _handle_reschedule_reminder,
+    "delete_task": _handle_delete_task,
+    "delete_note": _handle_delete_note,
+    "delete_topic": _handle_delete_topic,
     "list_topic_kinds": _handle_list_topic_kinds,
     "list_task_categories": _handle_list_task_categories,
     "list_lesson_types": _handle_list_lesson_types,
@@ -1438,3 +1920,14 @@ async def execute_tool(
     except Exception as exc:
         logger.exception("Tool %s failed", name)
         return f"Error running {name}: {exc}", True
+
+# --- prompt caching --------------------------------------------------------
+
+# The tool schemas are ~5.8k tokens and completely static, and they sit at the
+# very front of the cached prefix (the API's cache order is tools, then system,
+# then messages). A breakpoint on the LAST schema therefore covers all of them.
+# Kept as a separate list rather than mutating TOOL_SCHEMAS in place so the raw
+# schemas stay usable for tests and introspection.
+TOOL_SCHEMAS_CACHED = TOOL_SCHEMAS[:-1] + [
+    {**TOOL_SCHEMAS[-1], "cache_control": {"type": "ephemeral"}}
+]
