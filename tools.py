@@ -811,6 +811,39 @@ TOOL_SCHEMAS = [
         },
     },
     {
+        "name": "search_notes",
+        "description": (
+            "Keyword-search the full text of the user's notes and return the "
+            "best-matching passages, ranked. Use this when the user is "
+            "looking for something by WHAT IT SAYS and you don't know where "
+            "it was filed -- 'what did I write about the chain rule', 'find "
+            "my note on recess week'. Use query_notes instead when you "
+            "already know the topic_id, or when the user is browsing a known "
+            "location ('show my notes under Backpropagation') or filtering "
+            "structurally (reference-only, one module). Matching is lexical, "
+            "not semantic: a note that says the same thing in different words "
+            "will NOT be found, so if a search returns nothing, say so rather "
+            "than concluding the note does not exist."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "The words to search for. Pass the user's own content "
+                        "words -- do not add filler."
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max passages to return, default 10.",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
         "name": "create_schedule_block",
         "description": (
             "Create a recurring weekly block (day_of_week) or a one-off "
@@ -1698,6 +1731,25 @@ def _handle_query_notes(tool_input: dict, chat_id: int, job_queue) -> str:
     return "\n".join(lines)
 
 
+def _handle_search_notes(tool_input: dict, chat_id: int, job_queue) -> str:
+    query = tool_input["query"]
+    hits = database.search_notes(
+        chat_id=chat_id, query=query, limit=tool_input.get("limit", 10)
+    )
+    if not hits:
+        return (
+            f"No notes matched {query!r}. Matching is by keyword, so a note "
+            "phrased differently would not show up here."
+        )
+    lines = []
+    for h in hits:
+        tag = "[reference] " if h["is_reference"] else ""
+        where = h["topic_name"] or "unfiled"
+        source_part = f" (source: {h['source']})" if h["source"] else ""
+        lines.append(f"[{where}] {tag}{h['text']}{source_part}")
+    return "\n".join(lines)
+
+
 _MAX_SCHEDULE_QUERY_DAYS = 400  # generous enough for a full semester/academic
 # year in one call -- expand_occurrences() is a cheap linear pass over
 # (days x blocks), so this is purely a sanity ceiling against a nonsensical
@@ -1898,6 +1950,7 @@ TOOL_HANDLERS: dict[str, Callable[[dict, int, object], str]] = {
     "list_topics": _handle_list_topics,
     "add_note": _handle_add_note,
     "query_notes": _handle_query_notes,
+    "search_notes": _handle_search_notes,
     "query_files": _handle_query_files,
     "set_file_nickname": _handle_set_file_nickname,
     "delete_file": _handle_delete_file,

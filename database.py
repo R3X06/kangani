@@ -14,6 +14,8 @@ import sqlite3
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+import retrieval
+
 logger = logging.getLogger(__name__)
 
 DB_PATH = Path(os.environ.get("DB_PATH", str(Path(__file__).parent / "kangani.db")))
@@ -611,6 +613,11 @@ def init_db() -> None:
         # chat_id. Also not gated behind _SCHEMA_VERSION -- see docstring.
         _migrate_notes_general(conn)
         conn.executescript(_INDEXES)
+        conn.executescript(_RETRIEVAL_SCHEMA)
+        # Indexes notes that predate the retrieval layer. Idempotent -- only
+        # touches notes with no chunks, so every run after the first is a
+        # no-op, same contract as _backfill_tags above.
+        retrieval.backfill(conn)
         conn.executescript(_EVAL_SCHEMA)
         # Additive for a DB created by an earlier version of _EVAL_SCHEMA --
         # CREATE TABLE IF NOT EXISTS is a no-op once `turns` exists, so a new
@@ -1633,6 +1640,15 @@ def create_note(
             (chat_id, topic_id, tag, source, content, 1 if is_reference else 0),
         )
         conn.commit()
+        # Index on the write path rather than in a batch job: a note the user
+        # just saved should be findable in the same conversation. Wrapped
+        # because a search index is not worth losing the note over -- the
+        # backfill in init_db picks up anything that failed here.
+        try:
+            retrieval.index_note(conn, cur.lastrowid, chat_id, content)
+            conn.commit()
+        except Exception:
+            logger.exception("Failed to index note %s for search", cur.lastrowid)
         row = conn.execute(
             "SELECT notes.*, topics.name AS topic_name "
             "FROM notes LEFT JOIN topics ON topics.id = notes.topic_id "
@@ -1994,6 +2010,57 @@ def get_recess_weeks(chat_id: int) -> set[int]:
     if not row or not row["recess_weeks"]:
         return set()
     return {int(p) for p in row["recess_weeks"].split(",")}
+
+# --- retrieval index -------------------------------------------------------
+#
+# Chunks of note content plus an inverted index over them. Separate from the
+# eval tables above: this is product surface (the search_notes tool), not
+# measurement.
+#
+# postings is WITHOUT ROWID with a (term, chunk_id) primary key -- the term
+# lookup that every query starts with is then served by the primary key itself
+# rather than a secondary index over a rowid table, which for a
+# write-once-read-many posting list is both smaller and one indirection
+# shorter.
+#
+# ON DELETE CASCADE runs the whole way down: deleting a topic cascades to its
+# notes, which cascades to note_chunks, which cascades to postings. That is
+# what keeps the index from drifting out of sync with the corpus, and it only
+# holds because get_connection sets foreign_keys = ON.
+
+_RETRIEVAL_SCHEMA = """
+CREATE TABLE IF NOT EXISTS note_chunks (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    note_id      INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+    chat_id      INTEGER NOT NULL,
+    chunk_index  INTEGER NOT NULL,
+    text         TEXT NOT NULL,
+    length       INTEGER NOT NULL,
+    char_start   INTEGER NOT NULL,
+    char_end     INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS postings (
+    term      TEXT NOT NULL,
+    chunk_id  INTEGER NOT NULL REFERENCES note_chunks(id) ON DELETE CASCADE,
+    tf        INTEGER NOT NULL,
+    PRIMARY KEY (term, chunk_id)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_note_chunks_note ON note_chunks(note_id);
+CREATE INDEX IF NOT EXISTS idx_note_chunks_chat ON note_chunks(chat_id);
+CREATE INDEX IF NOT EXISTS idx_postings_chunk   ON postings(chunk_id);
+"""
+
+
+def search_notes(chat_id: int, query: str, limit: int = 10) -> list[dict]:
+    """BM25-ranked note chunks for this chat. See retrieval.py."""
+    conn = get_connection()
+    try:
+        return retrieval.search(conn, chat_id, query, limit)
+    finally:
+        conn.close()
+
 
 # --- eval instrumentation --------------------------------------------------
 #
