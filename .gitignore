@@ -41,3 +41,13 @@ Thumbs.db
 # --- Local debugging scratch files ---
 body.json
 diff.txt
+
+# --- Eval: regenerable, bulky, or private ---
+eval/db/          # rebuilt by seed.py, deterministic
+eval/cache/       # ~134MB of raw API responses
+eval/real/        # copy of the real message history
+
+# eval/runs/, eval/METRICS.md and eval/figures/ are COMMITTED on purpose --
+# they are the evidence the write-up rests on. runs/ is ~850KB and contains
+# only fixture-derived content; cache/ is what makes the numbers cheap to
+# re-derive locally, not what makes them auditable.

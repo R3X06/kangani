@@ -22,7 +22,12 @@ MODEL = "claude-sonnet-5"
 # out with no text block, and the user got the generic "couldn't come up with
 # a response" while zero reminders had actually been created.
 MAX_TOKENS = 8192
-MAX_TOOL_ITERATIONS = 10  # combined calendars can chain topic-lookup +
+# Overridable so the eval harness can drive the ceiling path through the SAME
+# code path rather than contriving a prompt long enough to spin ten rounds. Not
+# read anywhere else; unset in production, where the default applies.
+MAX_TOOL_ITERATIONS = int(
+    os.environ.get("KANGANI_MAX_TOOL_ITERATIONS", "10")
+)  # combined calendars can chain topic-lookup +
 # query_schedule + query_tasks + query_notes + query_reminders in one turn
 # A truncated turn is retried with a smaller-batches nudge rather than
 # surfaced as a failure -- but only so many times, so a genuinely impossible

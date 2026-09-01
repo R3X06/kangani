@@ -1,0 +1,862 @@
+{
+  "request": {
+    "model": "claude-sonnet-5",
+    "max_tokens": 8192,
+    "system": [
+      {
+        "type": "text",
+        "text": "You are Kangani, a personal assistant running inside Telegram. You help the user manage a unified tree of topics (courses, modules, events, life areas) and the tasks, notes, reminders, and timetable lessons attached to them.\n\nUse the available tools whenever the user's request involves creating, updating, or querying tasks, modules, topics, notes, schedule blocks, events, or reminders stored in the database. For general conversation, clarification, or anything not backed by a tool, respond directly in plain text.\n\nEverything the user tracks lives in ONE tree of topics: courses, modules, events, and freeform life areas are all topics, nestable to any depth. A task, note, or reminder can attach to any topic via topic_id, or to nothing at all. Before creating a topic, call list_topics to avoid near-duplicates, and call list_topic_kinds to reuse an existing `kind` label rather than minting a near-synonym. `kind` is a free string (canonical ones: course, year, semester, module, component, event); matching is case-insensitive. Use kind='module' for an academic subject that appears on the timetable -- it gets a stable auto-assigned color. If a task or note doesn't obviously belong under a topic, you may leave it unattached: offer a topic once, but don't force one and don't re-ask if the user declines. If a request is genuinely ambiguous, ask a brief clarifying question rather than guessing.\n\nTopics can be nested into subtopics to any depth. Topic names are NOT guaranteed unique -- always call list_topics first to find the right topic_id before referencing an existing topic in add_note, query_notes, create_task, create_reminder, or as a parent_topic_id in create_topic. Never guess a topic_id.\n\nTwo different ways to reach a note. Use query_notes when the LOCATION is known -- a topic_id you just looked up, one module, reference-only. Use search_notes when the CONTENT is known but the location isn't: \"what did I write about the chain rule\", \"find my note on recess week\". Do not call list_topics first for search_notes; searching the text is the point. search_notes matches keywords, not meaning, so an empty result means those words don't appear -- report that honestly instead of stating the user has no note on the subject.\n\nWhen the user shares something worth saving and no existing topic clearly matches, create a new topic for it (nested under the closest existing relevant topic if one exists, otherwise as a new top-level topic under the right module) rather than forcing it into an unrelated topic. Do NOT invent a catch-all topic the way \"General\" is used as a fallback module for uncategorized tasks -- notes dumped into a generic bucket become unfindable by topic later. If it's genuinely unclear what topic or module a note belongs to, ask a brief clarifying question. Mark is_reference=true for material worth keeping for later lookup (a link, an excerpt, a definition); default to false for transient notes or observations.\n\n## Answering \"show me...\" / calendar / listing requests\n\nWhen the user asks to see things (\"my Y3S1 calendar\", \"sc2001 labs\", \"what's due\", \"general reminders\"), resolve the request COMPOSITIONALLY. Read the request as a set of constraint words plus the noun (\"calendar\", \"schedule\", \"list\") which itself carries no constraint. Classify EACH constraint word into exactly one of four independent axes, then return the INTERSECTION of all of them:\n\n1. SCOPE -- a topic name (a year, semester, module, event, or any topic). Resolves via list_topics to that topic AND everything nested beneath it (its subtree). Pass it as topic_id with include_subtopics=true (the default). If NO topic is named, scope is everything the user owns -- no topic filter.\n\nSCOPE SHORTHAND: if a scope word doesn't match any single topic name exactly, but decomposes into a sequence of topics that ARE nested inside each other (e.g. \"Y3S1\" doesn't exist as a topic, but \"Y3\" and \"S1\" do, and \"S1\" is a child of \"Y3\"), resolve it as that nested path -- scope is the innermost one (\"S1\" under \"Y3\"), same as if the user had said \"Y3 S1\" or \"S1 under Y3\". Match each piece against BOTH a topic's name AND its nickname: if the user nicknamed \"Year 1\" as \"Y1\" and \"Semester 1\" as \"S1\", then \"Y1S1\" resolves to S1-under-Y1 by matching the nicknames, exactly as it would by name. list_topics shows each topic's nickname and full name in parentheses, so use those when a raw scope word doesn't match a name directly. This applies to EVERY data request -- calendars, schedules, tasks, notes, files, deletes -- not just calendars. Try this name-or-nickname decomposition BEFORE concluding a scope word is unrecognized. Only fall through to \"I don't recognize that word\" if no such nested-path decomposition exists by name or nickname either.\n\n2. CONTENT TYPE -- which of lessons / tasks / notes / reminders to return. If the user names a type (\"lessons\", \"classes\", \"tasks\", \"deadlines\", \"notes\", \"reminders\"), return ONLY that type. If they name NO type (e.g. \"Y3S1 calendar\" alone), return the FULL combined view: lessons + tasks + reminders + notes, by calling the relevant query tools and presenting them together in one reply. The bare word \"calendar\"/\"schedule\"/\"list\" is NOT a type word -- it means \"combine everything\", not \"lessons only\".\n\n3. FILTER -- a narrowing word WITHIN a content type. A lesson type (lecture, tutorial, lab, seminar, or any user-defined one -- resolve via list_lesson_types, pass as lesson_types to query_schedule); a task category (resolve via list_task_categories, pass as category to query_tasks); or the reminder scope word \"general\" (pass scope='general' to query_reminders). Lesson types are SUBTYPES of lessons: \"lessons\" returns all of them; \"labs\" returns only labs; \"lessons\" is inclusive of labs.\n\n4. TIME / ORDER -- a date range (\"today\", \"this week\", \"next Friday\", \"in August\") maps to date_from/date_to; \"next\"/\"soonest\" means take the earliest one; \"upcoming\" means future-only. Time is its own axis and ANDs in alongside scope, type, and filter.\n\nWorked examples (SCOPE then FILTER, \"calendar\" ignored as a bare noun):\n- \"Y3S1 calendar\" -> scope=Y3S1 subtree, no type named -> full combined view (lessons + tasks + reminders + notes under Y3S1).\n- \"Y3S1 lesson calendar\" -> scope=Y3S1, type=lessons -> query_schedule with topic_id=Y3S1.\n- \"sc2001 lab\" -> scope=SC2001, filter=lesson-type lab -> query_schedule with topic_id=SC2001, lesson_types=['lab'].\n- \"labs\" -> no scope, filter=lab -> query_schedule with lesson_types=['lab'], no topic filter (all labs, every topic).\n- \"Y3S1 labs\" -> scope=Y3S1, filter=lab -> all labs under Y3S1.\n- \"general reminders\" -> type=reminders, filter=general -> query_reminders scope='general'.\n- \"all reminders\" / \"my reminders\" -> type=reminders -> query_reminders scope='all'.\n\nEvery constraint word is a bare filter applied across the widest scope unless a scope word narrows WHERE to look: \"labs\" means all labs everywhere; \"Y3S1 labs\" means labs under Y3S1 only. Absence of a scope word is the widest scope, never an error.\n\nResolving words to axes -- and the rules that keep it honest:\n- Resolve filter words against the LIVE vocabularies (list_lesson_types, list_task_categories, list_topic_kinds) plus the fixed type words, not against a fixed list you assume. Call them when unsure what a word is.\n- A word that belongs to exactly ONE axis resolves silently. A word that is a genuine member of TWO axes at once (e.g. the user made a task category \"lab\" AND a lesson type \"lab\", so \"sc2001 lab\" could mean either) -- ONLY THEN ask which they meant. Don't invent collisions; most words resolve cleanly.\n- If a word matches NO topic and NO known filter/type (\"y3s1 quantum calendar\" where \"quantum\" is nothing) -- do NOT silently drop it and return the broad result as if it were never said. Say you don't recognize that word under that scope, and ask. A silently-dropped filter is the worst outcome: the user gets a broad answer that looks complete but ignored their constraint.\n- Distinguish \"valid filter, zero matches\" from \"unrecognized word\". \"sc2001 seminar\" when SC2001 has no seminars -> \"SC2001 has no seminars\" (the filter resolved, nothing matched). That is DIFFERENT from not knowing what a word means. Only claim \"you have no X\" when X actually resolved to a known type/filter.\n- \"deadlines\" means tasks that HAVE a deadline, ordered by date -- a deadline is a field on a task, not a separate item type. Use query_tasks and present the dated ones in date order.\n\nPast-vs-future default when the user gives NO time words: recurring lessons ALWAYS show (they are the timeless weekly timetable). Dated items -- tasks with deadlines, reminders, one-off events -- default to NOT-yet-past (from today onward), since nobody asking for a calendar wants last month's finished items cluttering it. Only include past dated items if the user explicitly asks (\"show completed\", \"last week\").\n\nSchedule blocks hold a recurring weekly timetable (day_of_week) or one-off calendar items (specific_date) -- exactly one of the two is ever set for a given block. Standing commitments phrased like \"every Tuesday\", \"each Monday\", or a recurring class/lecture should use day_of_week; a single occurrence phrased like \"this Friday\" or \"on August 15th\" should use specific_date. Unlike tasks, schedule blocks do NOT need a module at all -- omit module_name entirely for non-study blocks (gym, errands, appointments); do not invent or fall back to a \"General\" module for these. specific_date, start_time, and end_time for schedule blocks are plain local calendar/clock values, not absolute instants -- do NOT attach a UTC offset or convert timezones for them the way you do for deadline/trigger_datetime. When the user asks \"what's on this week\", treat \"this week\" as the Monday-Sunday calendar week containing the current local date given at the end of this prompt, unless they explicitly ask for something else (e.g. \"the next 7 days\"). Before calling delete_schedule_block, call query_schedule first to find the correct schedule_block_id -- never guess it.\n\nSome classes don't run every week -- they alternate (odd/even weeks) or run on specific weeks. To handle this, each chat has ONE semester anchor: the calendar date week 1 begins (its Monday). From that single date Kangani derives which semester week any date falls in. Set or update it with set_semester_start when the user tells you the start date (e.g. \"week 1 starts August 13th\"). When creating a recurring schedule block that does NOT run every week, set create_schedule_block's week_pattern ('odd', 'even', or an explicit list like '2,4,6,8,10,12'); leave it as the default 'every' otherwise. A non-'every' pattern cannot be resolved without the anchor, so if the user asks for an alternating/specific-week class and no semester start date is set yet, ask them for it ONCE (which date is week 1?) before creating the block -- don't ask repeatedly once it's set.\n\nSome semesters have a recess/reading/break week partway through with no classes. When the user mentions one, call set_recess_weeks with any single date that falls within that week (its Monday is fine) -- one date per recess week. Kangani's week numbers are the school's OFFICIAL numbers: once recess weeks are marked, they are skipped automatically, so \"week 8\" always means the school's week 8 even after a break has shifted the calendar. NEVER track or apply a week-number offset yourself in conversation to account for a recess -- that is exactly what set_recess_weeks does deterministically, and manual arithmetic would drift. set_recess_weeks marks a whole week off, not individual classes (use week_pattern to skip specific classes).\n\nA time-boxed one-off activity (a hackathon, a talk, a workshop) is just a topic with kind='event' (or 'event:<type>', e.g. 'event:hackathon') and an event_datetime. Setting event_datetime on create_topic auto-creates reminders before it (default 60 and 30 minutes before; pass reminder_offsets_minutes to change them, or call add_event_reminder later to add another lead time). Create events with create_topic like any other topic, and attach tasks/notes to them by topic_id -- look the id up via list_topics, never guess it.\n\nA topic has THREE independent name fields, never overwriting each other: `name` (short display/code, e.g. \"SC2001\" -- used for matching and breadcrumbs), `full_name` (the official long title, e.g. \"Data Structures and Algorithms\" -- set it whenever you learn one, such as from a schedule PDF's course title), and `nickname` (a short label the USER chose, e.g. \"DSA\" -- only set this when the user explicitly gives one, never invent one). Use set_topic_names to edit any of these after creation; it overwrites the given field(s), unlike create_topic's fill-only behavior on an existing match.\n\nIf a topic was created in the wrong place in the tree (e.g. a module a PDF import landed at the root, or the user just wants to reorganize), use move_topic to reparent it -- look up both the topic and its new parent via list_topics first, never guess the ids.\n\nHow a module's name is DISPLAYED in a timetable listing or image is a separate question from which name field is stored -- controlled by label_format: 'code' (the default), 'full_name', 'nickname', 'code_nickname' (\"SC2001: DSA\"), or 'code_full_name'. query_schedule takes an optional label_format for a one-off request (\"show full names just this once\"). But /dayimage, /weekimage, /monthimage, /today, and /week are direct slash commands that never reach you, so they always use a SAVED per-chat default -- call set_timetable_label_format when the user asks to change how things are labeled going forward (e.g. \"use my nicknames on the timetable\"), not just query_schedule's one-off override.\n\nCategories (on tasks) and lesson types (on schedule blocks) are user-defined labels that work like topic `kind`: before assigning a NEW one, call list_task_categories / list_lesson_types and REUSE an existing label if one fits (matching is case-insensitive) rather than minting a near-synonym ('assignment' vs 'Assignments', 'Tut' vs 'Tutorial'). When you are about to create a genuinely new category or lesson type, CONFIRM the name with the user first, showing the ones that already exist so they can pick an existing one instead -- e.g. \"New task category 'assignment' (existing: coursework, reading). Create it, or use an existing one?\". BUT never block the underlying action on that confirmation: create the task (or schedule block) immediately, leaving it uncategorized if the user hasn't confirmed the label yet, then offer to file it. An uncategorized task that got saved is always better than a lost one.\n\nA note attaches to a topic by topic_id, or to nothing at all (a \"general\" note). If a note doesn't clearly belong under any topic, save it as a general note (omit topic_id) rather than forcing it somewhere -- offer a topic once if one seems fitting, don't force it.\n\nEvery task, note, and reminder has a hidden reference tag -- a short random code, stable for that item's whole life. Tags are HIDDEN by default: never show them in normal listings. Only pass show_tags=true when the user explicitly asks to see tags (e.g. \"notes -tag\", \"show tags\", \"with tags\"). The tag is how the user can refer to one specific item unambiguously later.\n\nReminders for lessons are a BULK operation: use add_lesson_reminders, never a loop of create_reminder. A request like \"10 minutes before every lesson in Y3S1 for the next 3 weeks\" is dozens or hundreds of reminders, and issuing them one at a time runs out of room part-way through -- leaving the user with some of them and a message claiming all of them were set. add_lesson_reminders expands the timetable itself, honours each lesson's week pattern and the chat's recess weeks, skips occurrences already in the past, and skips exact duplicates, so it is safe to retry. For any range longer than about a week, call it with dry_run=true first, tell the user the resulting count, and wait for them to confirm before the real call. create_reminder remains the right tool for a genuine one-off.\n\nNever tell the user something was created, updated, or deleted unless a tool result in this turn actually says so. If a tool failed, returned fewer items than expected, or you ran out of tool calls before finishing, say exactly that and say what did land -- report the number the tool reported, not the number the user asked for. A confident but wrong confirmation is far worse than admitting a partial result, because the user only finds out when the reminder never arrives.\n\nWhen something is rescheduled or called off, deal with the reminders that were tied to the old time -- reschedule_reminder to move one, cancel_reminder to drop it. Leaving them in place means the user gets pinged for something that isn't happening. Deleting is for things that shouldn't exist at all; a finished task is update_task_status with status='done', not delete_task. delete_topic takes a whole subtree with it, so run it once without confirm, read the counts back to the user, and wait for a clear yes.\n\nReply in plain text only -- no Markdown formatting.",
+        "cache_control": {
+          "type": "ephemeral"
+        }
+      },
+      {
+        "type": "text",
+        "text": "Current date/time:\n- Local (Asia/Singapore): 2026-08-26T17:00:00+0800 (Wednesday)\n- UTC: 2026-08-26T09:00:00Z\n\nWhen resolving relative dates and times (e.g. \"tomorrow\", \"next Friday\", \"in 2 minutes\") for deadlines or reminders, compute the target moment using whichever of the two anchors above is more natural for the arithmetic (usually the local one for phrases like \"tomorrow at 6pm\", or the UTC one for \"in N minutes/hours\"). Then output an ISO-8601 datetime with an EXPLICIT offset: either reuse the local offset shown above verbatim (e.g. 2026-07-10T18:00:00+0800) or convert fully to UTC and append 'Z' (e.g. 2026-07-10T10:00:00Z). Never output a datetime with no offset/Z, and never change the clock digits without also changing the offset to match -- the digits and the offset must describe the same absolute instant. You do not need to manually subtract the UTC offset yourself if you use the local anchor -- just attach the local offset shown above to your computed local time.\n"
+      }
+    ],
+    "tools": [
+      {
+        "name": "create_task",
+        "description": "Create a new task, optionally attached to a topic anywhere in the tree (a module, an event, or any freeform topic) via topic_id, or left unattached. Look the topic_id up via list_topics first, or create it with create_topic; never guess an id. A task without a clear home can be left unattached -- ask once if a topic seems wanted, but don't force one.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "title": {
+              "type": "string",
+              "description": "Short task title"
+            },
+            "topic_id": {
+              "type": "integer",
+              "description": "Optional id of the topic to attach this task to (module/event/any topic). Look it up via list_topics or create it via create_topic. Omit to leave the task unattached."
+            },
+            "deadline": {
+              "type": "string",
+              "description": "ISO-8601 datetime WITH AN EXPLICIT OFFSET, e.g. 2026-07-10T18:30:00+08:00 (local) or 2026-07-10T10:30:00Z (UTC). Omit if no deadline. Resolve relative dates (next Friday, tomorrow) against the current date/time given in the system prompt, and reuse the offset shown there."
+            },
+            "status": {
+              "type": "string",
+              "enum": [
+                "not_started",
+                "in_progress",
+                "blocked",
+                "done"
+              ],
+              "description": "Defaults to not_started if omitted"
+            },
+            "category": {
+              "type": "string",
+              "description": "Optional user-defined subcategory for this task, e.g. 'assignment', 'reading', 'admin'. Call list_task_categories FIRST and reuse an existing category if one fits (matching is case-insensitive) rather than minting a near-synonym. If proposing a NEW category, confirm the name with the user before creating -- but create the task immediately regardless (uncategorized if they haven't confirmed yet), never block saving the task on the category question."
+            }
+          },
+          "required": [
+            "title"
+          ]
+        }
+      },
+      {
+        "name": "query_tasks",
+        "description": "List tasks matching optional filters. Use this to answer questions like what's due this week or show my in-progress tasks.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "enum": [
+                "not_started",
+                "in_progress",
+                "blocked",
+                "done"
+              ]
+            },
+            "topic_id": {
+              "type": "integer",
+              "description": "Optional -- restrict to tasks attached to this topic (look it up via list_topics). By default this INCLUDES tasks on every topic nested under it (the subtree), so passing a semester or year topic_id returns everything beneath it. Set include_subtopics=false for only tasks on this exact topic."
+            },
+            "include_subtopics": {
+              "type": "boolean",
+              "description": "Default true. Only relevant when topic_id is given -- false restricts to the exact topic, excluding its subtree."
+            },
+            "category": {
+              "type": "string",
+              "description": "Optional -- restrict to tasks in this category (see list_task_categories). Case-insensitive."
+            },
+            "show_tags": {
+              "type": "boolean",
+              "description": "Default false. When true, each task's hidden tag is shown. Only set when the user explicitly asks for tags."
+            },
+            "deadline_from": {
+              "type": "string",
+              "description": "ISO-8601 UTC datetime, inclusive lower bound"
+            },
+            "deadline_to": {
+              "type": "string",
+              "description": "ISO-8601 UTC datetime, inclusive upper bound"
+            },
+            "limit": {
+              "type": "integer",
+              "description": "Max results, default 20"
+            }
+          },
+          "required": []
+        }
+      },
+      {
+        "name": "update_task_status",
+        "description": "Update a task's status and/or progress percentage. Look up the task_id via query_tasks first if the user refers to the task by name.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "task_id": {
+              "type": "integer"
+            },
+            "status": {
+              "type": "string",
+              "enum": [
+                "not_started",
+                "in_progress",
+                "blocked",
+                "done"
+              ]
+            },
+            "progress_pct": {
+              "type": "integer",
+              "description": "0-100"
+            }
+          },
+          "required": [
+            "task_id"
+          ]
+        }
+      },
+      {
+        "name": "add_lesson_reminders",
+        "description": "Create reminders in BULK for every lesson occurrence in a date range, in ONE call -- e.g. '10 minutes before every lesson in Y3S1 for the next 3 weeks'. Never loop create_reminder for this: one lesson-reminder request can be hundreds of reminders and issuing them one at a time will run out of room and silently create only some of them. Occurrences are expanded server-side from the timetable, honouring each lesson's week pattern and the chat's recess weeks, so you do not need to work out which dates a class actually runs. Reminders already in the past are skipped, and exact duplicates of existing pending reminders are skipped too, so re-running a request is safe. Each reminder is linked to its lesson's topic, so they show up under that topic later. ALWAYS call with dry_run=true first when the range is longer than about a week: that reports how many would be created without creating anything, so you can tell the user the scale and confirm.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "date_from": {
+              "type": "string",
+              "description": "ISO-8601 date YYYY-MM-DD, inclusive. Compute from the current date in the system prompt (e.g. '3 weeks from today' starts today)."
+            },
+            "date_to": {
+              "type": "string",
+              "description": "ISO-8601 date YYYY-MM-DD, inclusive."
+            },
+            "minutes_before": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              },
+              "description": "One entry per reminder wanted per lesson. [10] is the default; [20, 10, 5] gives three reminders before every lesson. Each entry multiplies the total, so check the count with dry_run first."
+            },
+            "topic_id": {
+              "type": "integer",
+              "description": "Restrict to lessons under this topic and everything nested beneath it -- this is how 'every lesson in Y3S1' works. Look it up via list_topics. Omit to cover every lesson in the chat."
+            },
+            "include_subtopics": {
+              "type": "boolean",
+              "description": "Default true. false restricts to the exact topic."
+            },
+            "lesson_types": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Optional -- only these lesson types, e.g. ['Tutorial', 'Lab']. Check the exact spellings with list_lesson_types first."
+            },
+            "dry_run": {
+              "type": "boolean",
+              "description": "Default false. true reports the count and a breakdown WITHOUT creating anything."
+            }
+          },
+          "required": [
+            "date_from",
+            "date_to"
+          ]
+        }
+      },
+      {
+        "name": "create_reminder",
+        "description": "Schedule a one-time reminder message to be sent at a specific future date/time. Optionally link it to an existing task.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "trigger_datetime": {
+              "type": "string",
+              "description": "ISO-8601 datetime WITH AN EXPLICIT OFFSET for when to send the reminder, e.g. 2026-07-10T18:30:00+08:00 (local) or 2026-07-10T10:30:00Z (UTC). Must be in the future."
+            },
+            "message": {
+              "type": "string",
+              "description": "The reminder text to send the user"
+            },
+            "linked_task_id": {
+              "type": "integer",
+              "description": "Optional task this reminder relates to. Mutually exclusive with linked_topic_id."
+            },
+            "linked_topic_id": {
+              "type": "integer",
+              "description": "Optional topic (e.g. an event) this reminder relates to. Mutually exclusive with linked_task_id."
+            }
+          },
+          "required": [
+            "trigger_datetime",
+            "message"
+          ]
+        }
+      },
+      {
+        "name": "cancel_reminder",
+        "description": "Cancel a pending reminder so it never fires. Use this whenever something is called off or moved -- if an event's time changed, cancel the reminders tied to the old time rather than leaving them to go off. Find the reminder_id with query_reminders first; never guess it. Cancelling keeps the record (status becomes cancelled) and removes it from the pending list; to move a reminder to a different time instead, use reschedule_reminder, which keeps it as one reminder rather than a cancelled one plus a new one.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "reminder_id": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "reminder_id"
+          ]
+        }
+      },
+      {
+        "name": "reschedule_reminder",
+        "description": "Move a pending reminder to a different time, in place. Prefer this over cancelling and re-creating, so the user sees one reminder rather than two. Look the reminder_id up via query_reminders first. Only works while the reminder is still pending -- a reminder that already fired can't be moved, create a new one instead.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "reminder_id": {
+              "type": "integer"
+            },
+            "new_trigger_datetime": {
+              "type": "string",
+              "description": "ISO-8601 datetime WITH AN EXPLICIT OFFSET, e.g. 2026-09-04T15:30:00+08:00. Must be in the future."
+            }
+          },
+          "required": [
+            "reminder_id",
+            "new_trigger_datetime"
+          ]
+        }
+      },
+      {
+        "name": "delete_task",
+        "description": "Permanently delete a task. Only for a task that shouldn't exist at all (a mistake, a duplicate) -- when the user has simply finished something, use update_task_status with status='done' instead, which keeps the record. Look the task_id up via query_tasks first; never guess it. Any pending reminders linked to the task go with it.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "task_id": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "task_id"
+          ]
+        }
+      },
+      {
+        "name": "delete_note",
+        "description": "Permanently delete a note. Look the note_id up via query_notes first; never guess it.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "note_id": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "note_id"
+          ]
+        }
+      },
+      {
+        "name": "delete_topic",
+        "description": "Permanently delete a topic AND everything nested underneath it -- every subtopic, and all the tasks, notes, lessons, files and reminders attached to any of them. Deleting a semester topic removes that whole semester. Because of that, ALWAYS call once with confirm=false first: nothing is deleted and you get an exact count of what would go. Tell the user those numbers, wait for them to agree, and only then call again with confirm=true. Look the topic_id up via list_topics; never guess it.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "topic_id": {
+              "type": "integer"
+            },
+            "confirm": {
+              "type": "boolean",
+              "description": "Default false, which only reports what would be deleted. true actually deletes."
+            }
+          },
+          "required": [
+            "topic_id"
+          ]
+        }
+      },
+      {
+        "name": "list_topic_kinds",
+        "description": "List the topic 'kind' labels already in use for this chat (canonical ones like course/year/semester/module/component/event first). ALWAYS call this before inventing a new kind when creating a topic, and reuse an existing kind if one fits (matching is case-insensitive) rather than minting a near-duplicate.",
+        "input_schema": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      },
+      {
+        "name": "list_task_categories",
+        "description": "List the task categories already in use for this chat. ALWAYS call this before setting a NEW category on a task, and reuse an existing one if it fits (case-insensitive) rather than minting a near-synonym. Confirm a genuinely new category with the user before creating it (but never block saving the task on that).",
+        "input_schema": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      },
+      {
+        "name": "list_lesson_types",
+        "description": "List the lesson types (class_type -- lecture, tutorial, lab, seminar, etc.) already in use for this chat. ALWAYS call this before setting a NEW lesson type on a schedule block, and reuse an existing one if it fits (case-insensitive). Also use it to resolve a user's lesson-type filter word ('labs', 'tutorials') to the exact stored spelling before passing lesson_types to query_schedule.",
+        "input_schema": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      },
+      {
+        "name": "query_reminders",
+        "description": "List the chat's pending reminders. scope='general' returns only freestanding reminders (linked to no task and no topic) -- use for 'my general reminders'. scope='all' (default) returns every pending reminder. topic_id (with include_subtopics, default true) restricts to reminders linked to that topic and its subtree -- e.g. 'Y3S1 reminders'. Combine with query_schedule / query_tasks / query_notes for a full combined calendar. Set show_tags=true only when the user explicitly asks to see hidden tags.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "scope": {
+              "type": "string",
+              "enum": [
+                "general",
+                "all"
+              ],
+              "description": "'general' = unlinked only; 'all' (default) = every pending reminder."
+            },
+            "topic_id": {
+              "type": "integer",
+              "description": "Optional -- restrict to reminders linked to this topic and its subtree (look it up via list_topics)."
+            },
+            "include_subtopics": {
+              "type": "boolean",
+              "description": "Default true. false restricts to the exact topic."
+            },
+            "show_tags": {
+              "type": "boolean",
+              "description": "Default false. When true, each reminder's hidden tag is shown. Only set when the user explicitly asks."
+            }
+          },
+          "required": []
+        }
+      },
+      {
+        "name": "add_event_reminder",
+        "description": "Add another reminder for an event topic (one that has an event_datetime), firing the given number of minutes before it. Event topics already get default reminders when created; use this to bolt on an extra lead time (e.g. a day before). Look the topic_id up via list_topics.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "topic_id": {
+              "type": "integer"
+            },
+            "offset_minutes": {
+              "type": "integer",
+              "description": "Minutes before the event to fire the reminder"
+            }
+          },
+          "required": [
+            "topic_id",
+            "offset_minutes"
+          ]
+        }
+      },
+      {
+        "name": "create_topic",
+        "description": "Create a topic anywhere in the unified tree, or return the matching one if it already exists (same name, same parent, case-insensitive). Everything is a topic: a course, a module, an event, a freeform life area, or a subtopic of any of these. Pass parent_topic_id to nest it (look the parent up via list_topics -- names aren't unique); omit it for a top-level topic. Set `kind` to classify it -- call list_topic_kinds first and reuse an existing kind rather than inventing a near-duplicate. Use kind='module' for an academic subject that appears on the timetable (it gets an auto-assigned color). Set event_datetime for a one-off event to auto-create reminders before it.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "Short display name/code, e.g. SC2001 or Backpropagation -- used for lookups, breadcrumbs, and the 'code' timetable label format."
+            },
+            "full_name": {
+              "type": "string",
+              "description": "Optional official/long name, e.g. 'Data Structures and Algorithms'. Separate from `name` -- both are kept, never overwriting each other. Use set_topic_names to edit either after creation."
+            },
+            "kind": {
+              "type": "string",
+              "description": "Free-string classifier (canonical: course, year, semester, module, component, event). Call list_topic_kinds first and reuse an existing one if it fits. 'module' triggers timetable color assignment; 'event' (or 'event:<type>') marks a one-off event."
+            },
+            "status": {
+              "type": "string",
+              "description": "Optional free-string status for this topic"
+            },
+            "event_datetime": {
+              "type": "string",
+              "description": "For an event topic: ISO-8601 datetime WITH AN EXPLICIT OFFSET (e.g. 2026-09-01T14:00:00+08:00). Setting it auto-creates reminders before the event."
+            },
+            "reminder_offsets_minutes": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              },
+              "description": "Optional lead times (minutes before event_datetime) for the auto-created reminders; defaults to [60, 30]. Only meaningful with event_datetime."
+            },
+            "parent_topic_id": {
+              "type": "integer",
+              "description": "id of the parent topic, if this is a subtopic. Look it up via list_topics first -- topic names are not unique, so parents must be identified by id."
+            }
+          },
+          "required": [
+            "name"
+          ]
+        }
+      },
+      {
+        "name": "set_topic_names",
+        "description": "Edit a topic's name (short display/code), full_name (official long title), and/or nickname (a custom short label the user chose). Only pass the field(s) being changed -- omitted fields are left as-is. This OVERWRITES the given field(s), unlike create_topic's fill-only behavior on an existing match.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "topic_id": {
+              "type": "integer",
+              "description": "Look this up via list_topics"
+            },
+            "name": {
+              "type": "string"
+            },
+            "full_name": {
+              "type": "string"
+            },
+            "nickname": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "topic_id"
+          ]
+        }
+      },
+      {
+        "name": "move_topic",
+        "description": "Reparent an existing topic -- move it to sit under a different parent (or to the root, if new_parent_topic_id is omitted). Use this when a topic was created in the wrong place (e.g. a module imported from a PDF landed at the root and needs to move under a semester). Look up both ids via list_topics first. Refuses to create a cycle (can't move a topic under itself or its own subtopic).",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "topic_id": {
+              "type": "integer",
+              "description": "The topic to move."
+            },
+            "new_parent_topic_id": {
+              "type": "integer",
+              "description": "Omit to move the topic to the root."
+            }
+          },
+          "required": [
+            "topic_id"
+          ]
+        }
+      },
+      {
+        "name": "set_timetable_label_format",
+        "description": "Set the STANDING default label format used for /dayimage, /weekimage, /monthimage, and /today /week (these are direct slash commands, not routed through you, so they always use this saved preference rather than a per-message instruction). Call this when the user asks to change how modules are labeled going forward, e.g. 'show my timetable images with just course codes' or 'use my nicknames on the timetable'.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "label_format": {
+              "type": "string",
+              "enum": [
+                "code",
+                "full_name",
+                "nickname",
+                "code_nickname",
+                "code_full_name"
+              ],
+              "description": "code = SC2001. full_name = the official long title. nickname = the user's custom short label. code_nickname = 'SC2001: <nickname>'. code_full_name = 'SC2001: <full title>'. Falls back to code if the requested field isn't set on a given topic."
+            }
+          },
+          "required": [
+            "label_format"
+          ]
+        }
+      },
+      {
+        "name": "list_topics",
+        "description": "List topics for this chat, optionally filtered to one `kind`. Each result includes its id, kind, and a full breadcrumb path, e.g. 'Machine Learning > Neural Nets > Backpropagation'. Call this before create_topic with a parent_topic_id, before add_note or query_notes (to find the target topic_id), before attaching a task/reminder to a topic, and whenever you're unsure whether a similar topic already exists.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "description": "Optional -- restrict to topics of this kind"
+            }
+          },
+          "required": []
+        }
+      },
+      {
+        "name": "add_note",
+        "description": "Save a note. Attach it to an existing topic via topic_id (look it up via list_topics first, or create the topic with create_topic if none exists), OR omit topic_id entirely to save a GENERAL note attached to nothing -- for a thought or reminder-to-self that doesn't belong under any topic. Offer a topic once if one seems fitting, but don't force one. Mark is_reference=true for reference material (a link, a textbook excerpt, a definition worth keeping) vs a transient note (is_reference=false, the default).",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "topic_id": {
+              "type": "integer",
+              "description": "Optional. Omit for a general note attached to no topic."
+            },
+            "content": {
+              "type": "string",
+              "description": "The note text"
+            },
+            "source": {
+              "type": "string",
+              "description": "Optional origin, e.g. a URL, book title, or lecture name"
+            },
+            "is_reference": {
+              "type": "boolean",
+              "description": "True for reference material, false (default) for a regular note"
+            }
+          },
+          "required": [
+            "content"
+          ]
+        }
+      },
+      {
+        "name": "query_notes",
+        "description": "Retrieve notes. With no topic_id, returns ALL notes for the chat (general and topic-linked alike). With a topic_id, returns notes under that topic AND everything nested beneath it (its subtree) by default -- so a semester or year topic_id gathers all notes below it. Set include_subtopics=false for only notes directly on that exact topic. Set show_tags=true only if the user explicitly asks to see the hidden reference tags (e.g. 'notes -tag').",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "topic_id": {
+              "type": "integer",
+              "description": "Look this up via list_topics"
+            },
+            "include_subtopics": {
+              "type": "boolean",
+              "description": "Default true. Only relevant when topic_id is given -- false restricts to the exact topic, excluding its subtree."
+            },
+            "is_reference": {
+              "type": "boolean",
+              "description": "Filter to reference-only (true) or non-reference-only (false). Omit for both."
+            },
+            "show_tags": {
+              "type": "boolean",
+              "description": "Default false. When true, each note's hidden reference tag is shown. Only set when the user explicitly asks for tags."
+            },
+            "limit": {
+              "type": "integer",
+              "description": "Max results, default 20"
+            }
+          },
+          "required": []
+        }
+      },
+      {
+        "name": "query_files",
+        "description": "Retrieve stored files and SEND them back to the user. Files are documents/photos the user uploaded and filed under a topic (a personal cloud). With a topic_id, returns files under that topic AND everything nested beneath it (its subtree) by default -- so 'bring me the study notes files' resolves the 'Study Notes' topic and sends every file under it. With no topic_id, lists across all topics. Resolve the topic_id via list_topics first (matching name or nickname). Calling this both lists the files in your reply AND re-sends the actual files to the chat.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "topic_id": {
+              "type": "integer",
+              "description": "Restrict to files under this topic and its subtree. Look it up via list_topics."
+            },
+            "include_subtopics": {
+              "type": "boolean",
+              "description": "Default true. false = exact topic only."
+            },
+            "send": {
+              "type": "boolean",
+              "description": "Default true -- actually re-send the files to the chat. Set false to only LIST them (name/nickname) without sending, e.g. 'what files do I have under X'."
+            }
+          },
+          "required": []
+        }
+      },
+      {
+        "name": "set_file_nickname",
+        "description": "Give a stored file a nickname so the user can refer to it later. Look up the file's id via query_files (send=false) first.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "file_id": {
+              "type": "integer",
+              "description": "The file's row id (from query_files), NOT a Telegram id."
+            },
+            "nickname": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "file_id",
+            "nickname"
+          ]
+        }
+      },
+      {
+        "name": "delete_file",
+        "description": "Remove a stored file from Kangani (the copy on Telegram's servers is unaffected; this just forgets the reference). Look up the file's id via query_files first.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "file_id": {
+              "type": "integer",
+              "description": "The file's row id (from query_files)."
+            }
+          },
+          "required": [
+            "file_id"
+          ]
+        }
+      },
+      {
+        "name": "search_notes",
+        "description": "Keyword-search the full text of the user's notes and return the best-matching passages, ranked. Use this when the user is looking for something by WHAT IT SAYS and you don't know where it was filed -- 'what did I write about the chain rule', 'find my note on recess week'. Use query_notes instead when you already know the topic_id, or when the user is browsing a known location ('show my notes under Backpropagation') or filtering structurally (reference-only, one module). Matching is lexical, not semantic: a note that says the same thing in different words will NOT be found, so if a search returns nothing, say so rather than concluding the note does not exist.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "The words to search for. Pass the user's own content words -- do not add filler."
+            },
+            "limit": {
+              "type": "integer",
+              "description": "Max passages to return, default 10."
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      },
+      {
+        "name": "create_schedule_block",
+        "description": "Create a recurring weekly block (day_of_week) or a one-off block (specific_date) -- exactly one of the two must be given. Optionally tag it to a study module; omit module_name entirely for blocks that aren't study-related (gym, an errand, a personal appointment) -- unlike tasks, schedule blocks do not need a module.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "day_of_week": {
+              "type": "string",
+              "enum": [
+                "MON",
+                "TUE",
+                "WED",
+                "THU",
+                "FRI",
+                "SAT",
+                "SUN"
+              ],
+              "description": "Set for a block that recurs every week on this day. Do not also set specific_date."
+            },
+            "specific_date": {
+              "type": "string",
+              "description": "ISO-8601 date YYYY-MM-DD for a block that happens exactly once. Do not also set day_of_week."
+            },
+            "start_time": {
+              "type": "string",
+              "description": "24-hour local wall-clock time, HH:MM (e.g. 14:00). No timezone offset -- this is not an absolute instant."
+            },
+            "end_time": {
+              "type": "string",
+              "description": "24-hour local wall-clock time, HH:MM."
+            },
+            "module_name": {
+              "type": "string",
+              "description": "Optional. Omit if this block has no study module."
+            },
+            "class_type": {
+              "type": "string",
+              "description": "Optional lesson type, e.g. Lecture, Tutorial, Lab, Seminar, Workshop. Call list_lesson_types FIRST and reuse an existing one (matching is case-insensitive) rather than minting a near-synonym ('Tut' vs 'Tutorial'); confirm a genuinely NEW lesson type with the user before creating. Set this for timetable classes so a module's lecture and tutorial stay distinguishable. Omit for non-lesson blocks (gym, errands)."
+            },
+            "location": {
+              "type": "string",
+              "description": "Optional room/location."
+            },
+            "week_pattern": {
+              "type": "string",
+              "description": "Which semester weeks this recurring class actually runs. Defaults to 'every' (every week). Use 'odd' or 'even' for classes that alternate by week parity, or an explicit comma-separated list of week numbers (e.g. '2,4,6,8,10,12') for anything else. Only meaningful with day_of_week; leave as 'every' for one-off (specific_date) blocks. Non-'every' patterns require the chat's semester start date to be set first via set_semester_start."
+            }
+          },
+          "required": [
+            "start_time",
+            "end_time"
+          ]
+        }
+      },
+      {
+        "name": "query_schedule",
+        "description": "List schedule blocks (lessons). If BOTH date_from and date_to are given, recurring blocks are expanded into actual dated occurrences within that range and the result is date-ordered (use this for 'what's on today/this week' -- compute the bounds yourself from the current date shown in the system prompt). date_from/date_to together can span at most 400 days -- fine for a full semester or academic year in one call; for anything longer, issue multiple calls and combine the results yourself. If omitted, returns the raw weekly timetable plus one-off blocks, unexpanded. topic_id (with include_subtopics, default true) restricts to lessons under a topic and everything nested beneath it -- this is how a 'Y3S1 lesson calendar' works: resolve the topic, pass its id. lesson_types further narrows to specific types (e.g. just tutorial + lab). This tool covers the LESSON portion of a calendar only; combine it with query_tasks / query_notes / reminders for a full combined calendar.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "date_from": {
+              "type": "string",
+              "description": "ISO-8601 date YYYY-MM-DD, inclusive lower bound."
+            },
+            "date_to": {
+              "type": "string",
+              "description": "ISO-8601 date YYYY-MM-DD, inclusive upper bound."
+            },
+            "topic_id": {
+              "type": "integer",
+              "description": "Optional -- restrict to lessons under this topic and its subtree (look it up via list_topics). Prefer this over module_name for anything above module level (a semester, a year), since it walks the whole subtree."
+            },
+            "include_subtopics": {
+              "type": "boolean",
+              "description": "Default true. false restricts to the exact topic, excluding its subtree."
+            },
+            "lesson_types": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Optional -- restrict to these lesson types (e.g. ['tutorial','lab']). Case-insensitive. See list_lesson_types for what's in use."
+            },
+            "module_name": {
+              "type": "string",
+              "description": "Optional single-module shortcut. Does NOT walk a subtree -- use topic_id for that."
+            },
+            "label_format": {
+              "type": "string",
+              "enum": [
+                "code",
+                "full_name",
+                "nickname",
+                "code_nickname",
+                "code_full_name"
+              ],
+              "description": "Optional ad-hoc override for THIS request only (e.g. the user asks 'show full names just this once'). Omit to use the chat's saved default (see set_timetable_label_format)."
+            }
+          },
+          "required": []
+        }
+      },
+      {
+        "name": "delete_schedule_block",
+        "description": "Permanently remove a schedule block (recurring or one-off), e.g. when a class changed room/time or was cancelled. Call query_schedule first to find the correct schedule_block_id -- never guess it.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "schedule_block_id": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "schedule_block_id"
+          ]
+        }
+      },
+      {
+        "name": "set_semester_start",
+        "description": "Set (or update) the calendar date that semester week 1 begins for this chat -- the single anchor Kangani uses to compute which semester week any date falls in, so alternating classes (odd/even weeks, or specific week lists) resolve correctly. Call this when the user tells you the start date (e.g. 'week 1 starts August 13th', 'the week of Aug 13 is week 1'). Pass the FIRST DAY (Monday) of week 1. Idempotent -- calling again just updates the anchor.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "start_date": {
+              "type": "string",
+              "description": "ISO-8601 date YYYY-MM-DD -- the Monday that semester week 1 begins."
+            }
+          },
+          "required": [
+            "start_date"
+          ]
+        }
+      },
+      {
+        "name": "set_recess_weeks",
+        "description": "Mark one or more recess / reading / break weeks (weeks with no teaching) so Kangani's week numbers stay aligned with the school's OFFICIAL numbering -- recess weeks are then skipped automatically when counting weeks, and classes are hidden during them. Identify each recess week by ANY single calendar date that falls within it (e.g. its Monday) -- you do NOT need to work out its week number. This marks a WHOLE week as recess; it is not for skipping an individual class (use a week_pattern for that). For a multi-week break, pass one date from each week. Requires the semester start date to be set first. Idempotent -- calling again replaces the recess set entirely.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "recess_dates": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "ISO-8601 dates YYYY-MM-DD, one per recess week (any date within the week)."
+            }
+          },
+          "required": [
+            "recess_dates"
+          ]
+        },
+        "cache_control": {
+          "type": "ephemeral"
+        }
+      }
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "show full module names on my timetable instead of the codes",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_01BfKR6eigzRzSGeaezxed5x",
+            "name": "set_timetable_label_format",
+            "input": {
+              "label_format": "full_name"
+            }
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "toolu_01BfKR6eigzRzSGeaezxed5x",
+            "content": "Timetable label format set to 'full_name' -- this applies to /dayimage, /weekimage, /monthimage, /today, and /week going forward.",
+            "is_error": false,
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "response": {
+    "id": "msg_011Cech31fgbvNJw3gmyyLoj",
+    "container": null,
+    "content": [
+      {
+        "citations": null,
+        "text": "Done \u2014 your timetable (/dayimage, /weekimage, /monthimage, /today, /week) will now show full module names instead of codes going forward. Note: any module without a full_name set will just fall back to showing its code.",
+        "type": "text"
+      }
+    ],
+    "model": "claude-sonnet-5",
+    "role": "assistant",
+    "stop_details": null,
+    "stop_reason": "end_turn",
+    "stop_sequence": null,
+    "type": "message",
+    "usage": {
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 17509,
+      "inference_geo": "global",
+      "input_tokens": 2,
+      "output_tokens": 71,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      },
+      "server_tool_use": null,
+      "service_tier": "standard"
+    }
+  },
+  "cached_at": "2026-09-01T12:06:47.271477+00:00"
+}

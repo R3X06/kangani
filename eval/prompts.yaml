@@ -1,0 +1,682 @@
+# Kangani evaluation prompt suite.
+#
+# SCHEMA
+#   id              stable join key across repeat runs. The analysis groups on
+#                   this, not on message text.
+#   message         exactly what gets sent, verbatim, including casing and
+#                   punctuation -- both matter to dispatch_text_shortcut.
+#   expected_tool   the DECISIVE tool for this prompt, or null for a prompt
+#                   that should never reach Claude. Prerequisite lookups are
+#                   not listed: the system prompt mandates list_topics before
+#                   most mutations and query_tasks before a delete, so those
+#                   fire too. Dispatch accuracy is "did expected_tool appear in
+#                   this turn's tool_calls", not "was it the only one".
+#   expected_route  one of answer | button_route | intercepted | ceiling |
+#                   truncated | error. Describes the DEFAULT config. Under the
+#                   MAX_TOOL_ITERATIONS=2 ceiling config, multi-tool prompts
+#                   are expected to come back 'ceiling' instead, and that
+#                   divergence is the measurement, not a failure.
+#   states          fixtures this prompt is meaningful against. A delete prompt
+#                   has no valid target in the empty DB, so asserting a tool
+#                   call there would be asserting a hallucination.
+#   notes           why this entry exists. Written for whoever reads the
+#                   results, not for whoever writes the runner.
+#
+# Prompts target the `full` fixture's actual contents -- CZ3005/CZ3001/CZ3004,
+# the seeded tasks, the three near-duplicate note pairs. A prompt naming data
+# that isn't there measures nothing.
+
+# ---------------------------------------------------------------------------
+# A. One entry per registered tool (31)
+# ---------------------------------------------------------------------------
+
+- id: tool_create_task
+  message: "add a task to finish the A* tutorial questions by next Friday"
+  expected_tool: create_task
+  expected_route: answer
+  states: [full, empty, single, conflicting]
+  notes: "Relative date resolution plus topic attachment. Valid everywhere -- creating needs no prior data."
+
+- id: tool_query_tasks
+  message: "what's due this week?"
+  expected_tool: query_tasks
+  expected_route: answer
+  states: [full, empty, single, conflicting]
+  notes: "Bare 'tasks' is a shortcut; the week filter must fall through to Claude. Twin of shortcut_tasks."
+
+- id: tool_update_task_status
+  message: "mark the ultrasonic sensor task as in progress"
+  expected_tool: update_task_status
+  expected_route: answer
+  states: [full]
+  notes: "Seeded as 'blocked', so this is a real transition rather than a no-op."
+
+- id: tool_create_reminder
+  message: "remind me to email the prof at 5pm tomorrow"
+  expected_tool: create_reminder
+  expected_route: answer
+  states: [full, empty, single, conflicting]
+  notes: "Single one-off reminder. Contrast with tool_add_lesson_reminders, which is the bulk path."
+
+- id: tool_add_lesson_reminders
+  message: "remind me 15 minutes before every CZ3005 lecture"
+  expected_tool: add_lesson_reminders
+  expected_route: answer
+  states: [full]
+  notes: >-
+    The bulk path that produced the max_tokens truncation documented in
+    brain.py. Most likely prompt in the suite to come back 'truncated'.
+
+- id: tool_cancel_reminder
+  message: "cancel the reminder about the progress report"
+  expected_tool: cancel_reminder
+  expected_route: answer
+  states: [full]
+  notes: "Requires query_reminders first to resolve the id. Named, not numbered, on purpose."
+
+- id: tool_reschedule_reminder
+  message: "push the A* assignment reminder back to Saturday morning"
+  expected_tool: reschedule_reminder
+  expected_route: answer
+  states: [full]
+  notes: "Distinguishes reschedule from cancel-and-recreate. Both would satisfy the user; only one is correct."
+
+- id: tool_delete_task
+  message: "delete the peer review task"
+  expected_tool: delete_task
+  expected_route: answer
+  states: [full]
+  notes: "Destructive. Watch whether it confirms first or deletes immediately."
+
+- id: tool_delete_note
+  message: "delete my note about the group meeting"
+  expected_tool: delete_note
+  expected_route: answer
+  states: [full]
+  notes: "Target is a plain seeded note, not one of the near-duplicate pair members."
+
+- id: tool_delete_topic
+  message: "remove the CZ3004 topic entirely"
+  expected_tool: delete_topic
+  expected_route: answer
+  states: [full]
+  notes: >-
+    Cascades to tasks, notes, chunks and postings. Worth checking the retrieval
+    index is clean afterward, not just the topic row.
+
+- id: tool_list_topic_kinds
+  message: "what kinds of topics can I use?"
+  expected_tool: list_topic_kinds
+  expected_route: answer
+  states: [full, empty, single, conflicting]
+  notes: "Vocabulary tool. Prime dead-tool candidate -- nothing in normal use needs it."
+
+- id: tool_list_task_categories
+  message: "what task categories am I already using?"
+  expected_tool: list_task_categories
+  expected_route: answer
+  states: [full, single]
+  notes: "Same family as list_topic_kinds. Also a likely dead tool."
+
+- id: tool_list_lesson_types
+  message: "what class types are in my timetable?"
+  expected_tool: list_lesson_types
+  expected_route: answer
+  states: [full]
+  notes: "Fixture seeds Lecture, Tutorial, Lab and Consultation so the answer is non-trivial."
+
+- id: tool_query_reminders
+  message: "what reminders do I have coming up?"
+  expected_tool: query_reminders
+  expected_route: answer
+  states: [full, empty, single, conflicting]
+  notes: "Twin of shortcut_reminders. 'my reminders' is deterministic; this phrasing is not."
+
+- id: tool_add_event_reminder
+  message: "set up reminders before the MDP consultation on the 27th"
+  expected_tool: add_event_reminder
+  expected_route: answer
+  states: [full]
+  notes: "Event-dated topic path, distinct from the lesson-block path in add_lesson_reminders."
+
+- id: tool_create_topic
+  message: "make a new topic under CZ3005 for search algorithms"
+  expected_tool: create_topic
+  expected_route: answer
+  states: [full, single]
+  notes: "Parent named, not given by id -- requires list_topics first per the system prompt."
+
+- id: tool_set_topic_names
+  message: "set the full name of CZ3004 to Multi-disciplinary Design Project"
+  expected_tool: set_topic_names
+  expected_route: answer
+  states: [full]
+  notes: "name / full_name / nickname are three separate fields that must not overwrite each other."
+
+- id: tool_move_topic
+  message: "move the search algorithms topic under CZ3001 instead"
+  expected_tool: move_topic
+  expected_route: answer
+  states: [full]
+  notes: "Depends on tool_create_topic having run. Order-dependent -- flag if the runner shuffles."
+
+- id: tool_set_timetable_label_format
+  message: "show full module names on my timetable instead of the codes"
+  expected_tool: set_timetable_label_format
+  expected_route: answer
+  states: [full, empty, single, conflicting]
+  notes: "Settings write. Reachable through the settings UI too, so a plausible dead tool."
+
+- id: tool_list_topics
+  message: "what topics do I have set up?"
+  expected_tool: list_topics
+  expected_route: answer
+  states: [full, empty, single, conflicting]
+  notes: "Twin of shortcut_topics. Also the most common prerequisite call in the suite."
+
+- id: tool_add_note
+  message: "note under CZ3005: iterative deepening gives cheap move ordering for alpha-beta"
+  expected_tool: add_note
+  expected_route: answer
+  states: [full, single]
+  notes: >-
+    Explicit topic and explicit content. Should index into note_chunks on the
+    write path, so tool_search_notes can find it in the same run.
+
+- id: tool_query_notes
+  message: "show me my reference notes for CZ3001"
+  expected_tool: query_notes
+  expected_route: answer
+  states: [full]
+  notes: >-
+    Structural filter -- known module, reference-only. The correct tool is
+    query_notes, NOT search_notes. This is half the disambiguation pair.
+
+- id: tool_search_notes
+  message: "what did I write about the chain rule?"
+  expected_tool: search_notes
+  expected_route: answer
+  states: [full]
+  notes: >-
+    Content known, location unknown -- the other half of the pair. Retrieves the
+    lexical member of the chain_rule near-duplicate and misses the paraphrase,
+    by design.
+
+- id: tool_query_files
+  message: "what files have I saved?"
+  expected_tool: query_files
+  expected_route: answer
+  states: [full, single]
+  notes: "One seeded PDF in both states."
+
+- id: tool_set_file_nickname
+  message: "call the search slides file 'lecture 3 deck'"
+  expected_tool: set_file_nickname
+  expected_route: answer
+  states: [full]
+  notes: "Seeded nickname is 'search slides', so this is an overwrite, not a first set."
+
+- id: tool_delete_file
+  message: "delete the lecture 3 slides file"
+  expected_tool: delete_file
+  expected_route: answer
+  states: [full]
+  notes: "Deletes the DB row only; Telegram still holds the file. Check the reply doesn't overclaim."
+
+- id: tool_create_schedule_block
+  message: "I go to the gym every Thursday from 7 to 8pm"
+  expected_tool: create_schedule_block
+  expected_route: answer
+  states: [full, empty, single, conflicting]
+  notes: >-
+    Non-study block. The system prompt says omit the module entirely -- watch
+    for a spurious 'General' topic being invented instead.
+
+- id: tool_query_schedule
+  message: "what's on my timetable on Monday?"
+  expected_tool: query_schedule
+  expected_route: answer
+  states: [full, single, conflicting]
+  notes: "Single-day range. Against 'conflicting' the two Monday blocks overlap by 50 minutes."
+
+- id: tool_delete_schedule_block
+  message: "the Wednesday CZ3005 lab is cancelled, take it off my timetable"
+  expected_tool: delete_schedule_block
+  expected_route: answer
+  states: [full]
+  notes: "Requires query_schedule first for the id. Seeded as an even-week block."
+
+- id: tool_set_semester_start
+  message: "semester week 1 started on the 10th of August"
+  expected_tool: set_semester_start
+  expected_route: answer
+  states: [full, empty, single, conflicting]
+  notes: "Idempotent against the full fixture, which already has this anchor."
+
+- id: tool_set_recess_weeks
+  message: "recess week is the week of the 21st of September"
+  expected_tool: set_recess_weeks
+  expected_route: answer
+  states: [full, single]
+  notes: >-
+    Takes DATES and resolves them to week numbers, and needs an anchor set
+    first. Fails loudly on the empty DB, which is why empty is excluded.
+
+# ---------------------------------------------------------------------------
+# B. Persistent keyboard labels (7). Must never reach Claude.
+# ---------------------------------------------------------------------------
+
+- id: nav_today
+  message: "📅 Today"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Exact NAV_LABELS match, checked before the shortcut router."
+
+- id: nav_tasks
+  message: "📋 Tasks"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Emoji is part of the label; a mismatch here means a keyboards.py drift."
+
+- id: nav_reminders
+  message: "⏰ Reminders"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "The only nav label whose emoji is not in the astral plane."
+
+- id: nav_topics
+  message: "📚 Topics"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Straight nav dispatch."
+
+- id: nav_notes
+  message: "📝 Notes"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Straight nav dispatch."
+
+- id: nav_events
+  message: "🗓️ Events"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: >-
+    Carries a variation selector (U+FE0F) after the emoji. If this one entry
+    fails while the other six pass, the cause is the selector being stripped
+    somewhere in transit, not the router.
+
+- id: nav_add
+  message: "➕ Add"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Opens the quick-add flow. Any following reply should route 'intercepted', not to Claude."
+
+# ---------------------------------------------------------------------------
+# C. Text shortcuts (25). All 25 TEXT_SHORTCUTS keys, verbatim.
+# ---------------------------------------------------------------------------
+
+- id: shortcut_menu
+  message: "menu"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Slash-command equivalent."
+
+- id: shortcut_help
+  message: "help"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Bare 'help' is deterministic. Near-miss twin is nearmiss_help_plan."
+
+- id: shortcut_settings
+  message: "settings"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Slash-command equivalent."
+
+- id: shortcut_today
+  message: "today"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Zero-scope. Near-miss twin is nearmiss_today_location."
+
+- id: shortcut_whats_today_apostrophe
+  message: "what's today"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Curly-vs-straight apostrophe is the likely failure. The key uses a straight one."
+
+- id: shortcut_whats_today_plain
+  message: "whats today"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Apostrophe-free variant, present as a separate key."
+
+- id: shortcut_week
+  message: "week"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Near-miss twin is nearmiss_week_seven."
+
+- id: shortcut_this_week
+  message: "this week"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: >-
+    Deterministic, while 'what's due this week' is not. The pair shows how thin
+    the boundary is.
+
+- id: shortcut_my_week
+  message: "my week"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Possessive variant."
+
+- id: shortcut_tasks
+  message: "tasks"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Twin of tool_query_tasks."
+
+- id: shortcut_my_tasks
+  message: "my tasks"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Near-miss twin is nearmiss_tasks_blocked."
+
+- id: shortcut_show_tasks
+  message: "show tasks"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Imperative variant."
+
+- id: shortcut_show_my_tasks
+  message: "show my tasks"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Longest tasks shortcut; nearest to the fall-through boundary."
+
+- id: shortcut_reminders
+  message: "reminders"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Twin of tool_query_reminders."
+
+- id: shortcut_my_reminders
+  message: "my reminders"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Near-miss twin is nearmiss_reminders_scoped."
+
+- id: shortcut_show_reminders
+  message: "show reminders"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Imperative variant."
+
+- id: shortcut_topics
+  message: "topics"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Twin of tool_list_topics."
+
+- id: shortcut_my_topics
+  message: "my topics"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Possessive variant."
+
+- id: shortcut_show_topics
+  message: "show topics"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Imperative variant."
+
+- id: shortcut_notes
+  message: "notes"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Near-miss twin is nearmiss_notes_topic."
+
+- id: shortcut_my_notes
+  message: "my notes"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Possessive variant."
+
+- id: shortcut_show_notes
+  message: "show notes"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Imperative variant."
+
+- id: shortcut_events
+  message: "events"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Bare form."
+
+- id: shortcut_my_events
+  message: "my events"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Possessive variant."
+
+- id: shortcut_show_events
+  message: "show events"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Near-miss twin is nearmiss_events_month."
+
+# ---------------------------------------------------------------------------
+# D. Normalization cases. Should STILL route deterministically:
+# dispatch_text_shortcut lowercases and strips trailing ? ! .
+# ---------------------------------------------------------------------------
+
+- id: norm_tasks_question_mark
+  message: "tasks?"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Trailing '?' is stripped by rstrip. Should match 'tasks'."
+
+- id: norm_tasks_uppercase
+  message: "TASKS"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Casefolded before lookup."
+
+- id: norm_tasks_trailing_space
+  message: "  tasks  "
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Leading and trailing whitespace stripped. Realistic on mobile keyboards."
+
+- id: norm_today_exclamation
+  message: "Today!"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Case plus punctuation together."
+
+- id: norm_help_period
+  message: "help."
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: "Trailing period stripped."
+
+- id: norm_tasks_double_punct
+  message: "tasks??"
+  expected_tool: null
+  expected_route: button_route
+  states: [full, empty, single, conflicting]
+  notes: >-
+    rstrip removes ALL trailing chars in the set, not just one, so this should
+    still match. If it falls through, the router is using a single-char strip.
+
+# ---------------------------------------------------------------------------
+# E. Near-misses. Must FALL THROUGH to Claude. A button_route here is the
+# deterministic shortcut being wrong, which is the Phase 5 question.
+# ---------------------------------------------------------------------------
+
+- id: nearmiss_tasks_blocked
+  message: "my tasks that are blocked"
+  expected_tool: query_tasks
+  expected_route: answer
+  states: [full]
+  notes: "Prefix of 'my tasks' plus a real filter. Must not shortcut."
+
+- id: nearmiss_tasks_tomorrow
+  message: "tasks for tomorrow"
+  expected_tool: query_tasks
+  expected_route: answer
+  states: [full]
+  notes: "Prefix of 'tasks'. Shortcutting here would silently drop the date filter."
+
+- id: nearmiss_notes_topic
+  message: "notes on backpropagation"
+  expected_tool: search_notes
+  expected_route: answer
+  states: [full]
+  notes: >-
+    Prefix of 'notes'. Shortcutting shows ALL notes, which looks like a valid
+    answer and is not -- the worst kind of failure to detect from output alone.
+
+- id: nearmiss_today_location
+  message: "today's lecture location"
+  expected_tool: query_schedule
+  expected_route: answer
+  states: [full]
+  notes: "Prefix of 'today'. Note the apostrophe-s, which the normalizer does not strip."
+
+- id: nearmiss_week_seven
+  message: "week 7"
+  expected_tool: query_schedule
+  expected_route: answer
+  states: [full]
+  notes: "Prefix of 'week'. Recess week in the fixture, so the correct answer is 'nothing on'."
+
+- id: nearmiss_reminders_scoped
+  message: "my reminders about CZ3005"
+  expected_tool: query_reminders
+  expected_route: answer
+  states: [full]
+  notes: "Prefix of 'my reminders' plus a module scope."
+
+- id: nearmiss_events_month
+  message: "show events next month"
+  expected_tool: list_topics
+  expected_route: answer
+  states: [full]
+  notes: "Prefix of 'show events'. Events are topics with an event_datetime."
+
+- id: nearmiss_help_plan
+  message: "help me plan my week"
+  expected_tool: query_schedule
+  expected_route: answer
+  states: [full]
+  notes: >-
+    Prefix of 'help'. Shortcutting returns the help screen to someone asking
+    for planning, which reads as a non-sequitur rather than an error.
+
+- id: nearmiss_menu_modules
+  message: "menu of my modules"
+  expected_tool: list_topics
+  expected_route: answer
+  states: [full]
+  notes: "Prefix of 'menu'."
+
+- id: nearmiss_settings_reminders
+  message: "settings for my reminders"
+  expected_tool: query_reminders
+  expected_route: answer
+  states: [full]
+  notes: "Prefix of 'settings'. Ambiguous even to a human; expected_tool is a soft assertion here."
+
+# ---------------------------------------------------------------------------
+# F. State-specific behaviour. Same suite, different correct answer.
+# ---------------------------------------------------------------------------
+
+- id: edge_empty_query_tasks
+  message: "what tasks do I have?"
+  expected_tool: query_tasks
+  expected_route: answer
+  states: [empty]
+  notes: >-
+    Correct behaviour is to call the tool, get nothing, and say so. A reply
+    with no tool call is Claude answering from the system prompt, which is the
+    failure this entry exists to catch.
+
+- id: edge_empty_search_notes
+  message: "what did I write about backpropagation?"
+  expected_tool: search_notes
+  expected_route: answer
+  states: [empty]
+  notes: "Empty index. Must not conclude the user never wrote it -- only that nothing matched."
+
+- id: edge_conflicting_topic_name
+  message: "add a task under Assignment 1 to write the report"
+  expected_tool: list_topics
+  expected_route: answer
+  states: [conflicting]
+  notes: >-
+    'Assignment 1' exists under BOTH CZ3005 and CZ3001. The correct move is to
+    ask which. Silently picking one is the failure, and create_task appearing
+    in tool_calls is how it shows up.
+
+- id: edge_conflicting_duplicate_task
+  message: "when is Assignment 1 due?"
+  expected_tool: query_tasks
+  expected_route: answer
+  states: [conflicting]
+  notes: "Two tasks, same title, deadlines a week apart. Reporting one date is wrong."
+
+- id: edge_conflicting_overlap
+  message: "am I double-booked on Monday?"
+  expected_tool: query_schedule
+  expected_route: answer
+  states: [conflicting]
+  notes: >-
+    Two Monday blocks overlap 10:30-11:20. Nothing in the codebase detects
+    clashes, so this measures whether Claude spots it from raw rows.
+
+- id: edge_single_query_schedule
+  message: "what's my timetable like?"
+  expected_tool: query_schedule
+  expected_route: answer
+  states: [single]
+  notes: "One block. Unbounded query, so the unexpanded raw-timetable branch."
