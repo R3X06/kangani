@@ -2,6 +2,7 @@
 
 import logging
 import os
+import uuid
 
 from dotenv import load_dotenv
 from telegram import BotCommand, Update
@@ -94,6 +95,37 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+def _next_turn(context: ContextTypes.DEFAULT_TYPE) -> tuple[str, int]:
+    """Allocate (conversation_id, turn_index) for one inbound text message.
+
+    A "conversation" is one chat's traffic for one bot process lifetime --
+    chat_data is in-memory, so a restart starts a new conversation_id. That is
+    a real definition rather than an arbitrary one: history is also held in
+    chat_data, so a restart genuinely resets the context the agent is working
+    from. Every inbound text message gets a turn_index, including the ones that
+    never reach Claude, so button-route share and ceiling-hit rate have a
+    complete denominator.
+    """
+    conversation_id = context.chat_data.setdefault("conversation_id", uuid.uuid4().hex)
+    turn_index = context.chat_data.get("turn_index", 0) + 1
+    context.chat_data["turn_index"] = turn_index
+    return conversation_id, turn_index
+
+
+def _record_short_circuit(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str,
+    terminated_by: str,
+) -> None:
+    """Record a turn that resolved without any Claude call."""
+    conversation_id, turn_index = _next_turn(context)
+    database.record_turn_start(
+        conversation_id, turn_index, chat_id, len(text), text
+    )
+    database.finalize_turn(conversation_id, turn_index, terminated_by)
+
+
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None or update.message.text is None:
         # Edited messages, channel posts, and non-text updates route through
@@ -109,15 +141,24 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # the AI tool loop at all (see pdf_import.match_topics_by_name's
     # docstring). Consumed here means it never reaches brain.get_response.
     if await pdf_import.handle_pdf_import_reply(update, context):
+        _record_short_circuit(
+            context, update.effective_chat.id, update.message.text, "intercepted"
+        )
         return
 
     # Same pattern: a reply naming which topic an uploaded file goes under is
     # a plain-text answer to OUR prompt, consumed here before brain sees it.
     if await file_storage.handle_file_upload_reply(update, context):
+        _record_short_circuit(
+            context, update.effective_chat.id, update.message.text, "intercepted"
+        )
         return
 
     # Rename / nickname / add-subtopic replies answering a topic-screen prompt.
     if await callbacks.handle_topic_edit_reply(update, context):
+        _record_short_circuit(
+            context, update.effective_chat.id, update.message.text, "intercepted"
+        )
         return
 
     # A pending quick-add flow (task title, note content, reminder message,
@@ -126,6 +167,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # mid-way through asking a question, a nav-label-looking reply answers
     # the question rather than being treated as navigation.
     if await flows.handle_flow_reply(update, context):
+        _record_short_circuit(
+            context, update.effective_chat.id, update.message.text, "intercepted"
+        )
         return
 
     # Nav-button taps arrive as plain text too. Checked AFTER the pending-reply
@@ -137,6 +181,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # isn't consumed by any pending prompt is checked against NAV_LABELS.
     if update.message.text in keyboards.NAV_LABELS:
         await commands.nav_button_pressed(update, context)
+        _record_short_circuit(
+            context, update.effective_chat.id, update.message.text, "button_route"
+        )
         return
 
     # Bare unscoped phrases that are exact equivalents of an existing slash
@@ -146,6 +193,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # NAV_LABELS is: a reply answering a pending question must not be
     # reinterpreted as a shortcut just because it happens to match one.
     if await commands.dispatch_text_shortcut(update, context):
+        _record_short_circuit(
+            context, update.effective_chat.id, update.message.text, "button_route"
+        )
         return
 
     chat_id = update.effective_chat.id
@@ -157,13 +207,25 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         prefix = "\n".join(f"[{note}]" for note in pending_notes)
         user_text = f"{prefix}\n{user_text}"
 
+    conversation_id, turn_index = _next_turn(context)
     try:
         reply_text = await brain.get_response(
-            chat_id, user_text, history, context.job_queue
+            chat_id,
+            user_text,
+            history,
+            context.job_queue,
+            conversation_id=conversation_id,
+            turn_index=turn_index,
         )
     except Exception:
         logger.exception("brain.get_response failed for chat %s", chat_id)
         reply_text = "Sorry, something went wrong on my end -- try again in a moment."
+        # brain raised before its own finalize_turn ran, so the row is still
+        # sitting at the pessimistic 'error' default from record_turn_start.
+        # Re-finalize only to attach the reply the user actually saw.
+        database.finalize_turn(
+            conversation_id, turn_index, "error", reply_text=reply_text
+        )
 
     await update.message.reply_text(reply_text)
 

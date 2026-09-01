@@ -4,11 +4,13 @@ a tool, using Anthropic's native tool use / manual agentic loop.
 
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from anthropic import AsyncAnthropic
 
+import database
 import tools
 
 logger = logging.getLogger(__name__)
@@ -486,7 +488,17 @@ def _log_cache_usage(chat_id: int, calls: int, usage: dict) -> None:
     )
 
 
-async def get_response(chat_id: int, user_text: str, history: list, job_queue) -> str:
+async def get_response(
+    chat_id: int,
+    user_text: str,
+    history: list,
+    job_queue,
+    conversation_id: str | None = None,
+    turn_index: int = 0,
+) -> str:
+    """conversation_id/turn_index are eval instrumentation only. They default
+    to None/0 so every existing caller keeps working unchanged -- when
+    conversation_id is None nothing is recorded and this is the old function."""
     messages = history + [{"role": "user", "content": user_text}]
     # Index of this turn's incoming user message -- fixed for the whole turn,
     # so it works as a stable cache anchor as the tool rounds pile up.
@@ -494,6 +506,13 @@ async def get_response(chat_id: int, user_text: str, history: list, job_queue) -
     system_blocks = build_system_blocks(chat_id)
     usage = {"read": 0, "write": 0, "fresh": 0}
     calls = 0
+    api_ms = 0
+    iterations = 0
+    turn_started = time.perf_counter()
+    if conversation_id is not None:
+        database.record_turn_start(
+            conversation_id, turn_index, chat_id, len(user_text), user_text
+        )
 
     def _account(resp) -> None:
         u = getattr(resp, "usage", None)
@@ -503,7 +522,9 @@ async def get_response(chat_id: int, user_text: str, history: list, job_queue) -
         usage["write"] += getattr(u, "cache_creation_input_tokens", 0) or 0
         usage["fresh"] += getattr(u, "input_tokens", 0) or 0
 
-    def _commit(final_text: str, keep_tool_turns: bool = True) -> str:
+    def _commit(
+        final_text: str, keep_tool_turns: bool = True, terminated_by: str = "answer"
+    ) -> str:
         """Fold this turn into `history` and return the reply.
 
         The whole turn is kept -- assistant tool_use rounds and their
@@ -525,12 +546,25 @@ async def get_response(chat_id: int, user_text: str, history: list, job_queue) -
             history.append({"role": "assistant", "content": final_text})
         _trim_history(history)
         _log_cache_usage(chat_id, calls, usage)
+        if conversation_id is not None:
+            database.finalize_turn(
+                conversation_id,
+                turn_index,
+                terminated_by,
+                iterations=iterations,
+                api_calls=calls,
+                api_ms=api_ms,
+                total_ms=(time.perf_counter() - turn_started) * 1000,
+                reply_text=final_text,
+            )
         return final_text
 
     response = None
     hit_ceiling = True
     truncations = 0
-    for _ in range(MAX_TOOL_ITERATIONS):
+    for iteration in range(1, MAX_TOOL_ITERATIONS + 1):
+        iterations = iteration
+        _api_started = time.perf_counter()
         response = await _get_client().messages.create(
             model=MODEL,
             max_tokens=MAX_TOKENS,
@@ -538,6 +572,7 @@ async def get_response(chat_id: int, user_text: str, history: list, job_queue) -
             tools=tools.TOOL_SCHEMAS_CACHED,
             messages=_cache_messages(messages, turn_start),
         )
+        api_ms += (time.perf_counter() - _api_started) * 1000
         calls += 1
         _account(response)
         if response.stop_reason == "max_tokens":
@@ -552,7 +587,11 @@ async def get_response(chat_id: int, user_text: str, history: list, job_queue) -
                 chat_id, truncations,
             )
             if truncations > MAX_TRUNCATION_RETRIES:
-                return _commit(_OVER_BUDGET_REPLY, keep_tool_turns=False)
+                return _commit(
+                    _OVER_BUDGET_REPLY,
+                    keep_tool_turns=False,
+                    terminated_by="truncated",
+                )
             messages.append(
                 {
                     "role": "assistant",
@@ -574,11 +613,30 @@ async def get_response(chat_id: int, user_text: str, history: list, job_queue) -
             break
 
         tool_results = []
+        call_index = 0
         for block in response.content:
             if block.type == "tool_use":
+                # Timed around execute_tool only -- the handlers are synchronous
+                # SQLite (plus Playwright for the image tools), so this is real
+                # execution time, NOT the API round trip. The API round trip is
+                # accumulated separately in api_ms; keeping them apart matters
+                # because most handlers are sub-millisecond and would otherwise
+                # be buried under ~2s of network in any latency chart.
+                _tool_started = time.perf_counter()
                 result_text, is_error = await tools.execute_tool(
                     block.name, block.input, chat_id, job_queue
                 )
+                if conversation_id is not None:
+                    database.record_tool_call(
+                        conversation_id,
+                        turn_index,
+                        block.name,
+                        iteration,
+                        call_index,
+                        (time.perf_counter() - _tool_started) * 1000,
+                        is_error,
+                    )
+                call_index += 1
                 tool_results.append(
                     {
                         "type": "tool_result",
@@ -601,6 +659,7 @@ async def get_response(chat_id: int, user_text: str, history: list, job_queue) -
             "Hit MAX_TOOL_ITERATIONS for chat %s -- forcing a synthesis-only reply",
             chat_id,
         )
+        _api_started = time.perf_counter()
         response = await _get_client().messages.create(
             model=MODEL,
             max_tokens=MAX_TOKENS,
@@ -615,6 +674,7 @@ async def get_response(chat_id: int, user_text: str, history: list, job_queue) -
             ),
             messages=_cache_messages(messages, turn_start),
         )
+        api_ms += (time.perf_counter() - _api_started) * 1000
         calls += 1
         _account(response)
 
@@ -622,4 +682,6 @@ async def get_response(chat_id: int, user_text: str, history: list, job_queue) -
         (b.text for b in response.content if b.type == "text"), ""
     ) or "Sorry, I couldn't come up with a response for that -- try rephrasing."
 
-    return _commit(final_text)
+    return _commit(
+        final_text, terminated_by="ceiling" if hit_ceiling else "answer"
+    )

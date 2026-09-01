@@ -611,6 +611,12 @@ def init_db() -> None:
         # chat_id. Also not gated behind _SCHEMA_VERSION -- see docstring.
         _migrate_notes_general(conn)
         conn.executescript(_INDEXES)
+        conn.executescript(_EVAL_SCHEMA)
+        # Additive for a DB created by an earlier version of _EVAL_SCHEMA --
+        # CREATE TABLE IF NOT EXISTS is a no-op once `turns` exists, so a new
+        # column has to come through ALTER TABLE as everywhere else here.
+        _ensure_column(conn, "turns", "user_text", "TEXT")
+        _ensure_column(conn, "turns", "reply_text", "TEXT")
         _ensure_topic_unique_index(conn)
         _backfill_tags(conn)
         conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
@@ -1988,3 +1994,157 @@ def get_recess_weeks(chat_id: int) -> set[int]:
     if not row or not row["recess_weeks"]:
         return set()
     return {int(p) for p in row["recess_weeks"].split(",")}
+
+# --- eval instrumentation --------------------------------------------------
+#
+# Two tables, not one. `terminated_by` is a property of a whole TURN, but the
+# tool-call rows are written mid-loop, before the turn's outcome is known --
+# storing it per tool-call row would mean an UPDATE fanned out over every row
+# of the turn, and would leave turns that called NO tools (a button route, a
+# plain chat reply) with no row at all. That destroys the denominator for
+# both "ceiling-hit rate" and "button-route share": you can only compute a
+# rate if the turns that did nothing are counted too.
+#
+# The turn row is INSERTed up front with terminated_by='error' and updated on
+# a clean exit, so a hard crash mid-turn leaves a truthful row rather than a
+# missing one.
+#
+# tool_calls has no FOREIGN KEY to turns(id): the natural key
+# (conversation_id, turn_index) is already UNIQUE on turns and is what the
+# analysis joins on, and skipping the FK keeps a failed instrumentation write
+# on one side from cascading into the other.
+
+_EVAL_SCHEMA = """
+CREATE TABLE IF NOT EXISTS turns (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id  TEXT NOT NULL,
+    turn_index       INTEGER NOT NULL,
+    chat_id          INTEGER NOT NULL,
+    message_chars    INTEGER NOT NULL,
+    terminated_by    TEXT NOT NULL CHECK (terminated_by IN
+                        ('answer','ceiling','button_route','intercepted',
+                         'truncated','error')),
+    iterations       INTEGER NOT NULL DEFAULT 0,
+    api_calls        INTEGER NOT NULL DEFAULT 0,
+    api_ms           REAL NOT NULL DEFAULT 0,
+    total_ms         REAL NOT NULL DEFAULT 0,
+    -- Verbatim message text, both sides. Needed because the failure mode this
+    -- whole exercise exists to catch -- Kangani confidently reporting work it
+    -- never did (see brain.py's _commit docstring) -- leaves NO trace in any
+    -- other column: every tool returns clean, is_error is 0, no fallback
+    -- string fires. It is only visible by reading the reply. Hand-labelling
+    -- later is optional; capturing the text now is not, because a turn that
+    -- wasn't recorded can't be recovered.
+    user_text        TEXT,
+    reply_text       TEXT,
+    timestamp        TEXT NOT NULL DEFAULT (STRFTIME('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE (conversation_id, turn_index)
+);
+
+CREATE TABLE IF NOT EXISTS tool_calls (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id   TEXT NOT NULL,
+    turn_index        INTEGER NOT NULL,
+    tool_name         TEXT NOT NULL,
+    iteration_number  INTEGER NOT NULL,
+    call_index        INTEGER NOT NULL,
+    latency_ms        REAL NOT NULL,
+    is_error          INTEGER NOT NULL DEFAULT 0 CHECK (is_error IN (0,1)),
+    timestamp         TEXT NOT NULL DEFAULT (STRFTIME('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_turns_conv       ON turns(conversation_id, turn_index);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_turn  ON tool_calls(conversation_id, turn_index);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_name  ON tool_calls(tool_name);
+"""
+
+# On by default: dataset B is real Telegram traffic, so the instrumentation has
+# to be running in production to collect anything. Set to "0" to disable.
+INSTRUMENTATION_ENABLED = os.environ.get("KANGANI_INSTRUMENTATION", "1") != "0"
+
+
+def _instrument(fn):
+    """Instrumentation must never be able to take the bot down. Every write
+    below is best-effort: a failure is logged once and swallowed, because a
+    broken eval table is a lost data point and a raised exception is a lost
+    reply."""
+    def wrapper(*args, **kwargs):
+        if not INSTRUMENTATION_ENABLED:
+            return None
+        try:
+            return fn(*args, **kwargs)
+        except Exception:
+            logger.exception("instrumentation write failed in %s", fn.__name__)
+            return None
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
+
+@_instrument
+def record_turn_start(
+    conversation_id: str,
+    turn_index: int,
+    chat_id: int,
+    message_chars: int,
+    user_text: str | None = None,
+) -> None:
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO turns (conversation_id, turn_index, chat_id, "
+            "message_chars, user_text, terminated_by) "
+            "VALUES (?, ?, ?, ?, ?, 'error')",
+            (conversation_id, turn_index, chat_id, message_chars, user_text),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@_instrument
+def finalize_turn(
+    conversation_id: str,
+    turn_index: int,
+    terminated_by: str,
+    iterations: int = 0,
+    api_calls: int = 0,
+    api_ms: float = 0.0,
+    total_ms: float = 0.0,
+    reply_text: str | None = None,
+) -> None:
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE turns SET terminated_by = ?, iterations = ?, api_calls = ?, "
+            "api_ms = ?, total_ms = ?, reply_text = ? "
+            "WHERE conversation_id = ? AND turn_index = ?",
+            (terminated_by, iterations, api_calls, api_ms, total_ms, reply_text,
+             conversation_id, turn_index),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@_instrument
+def record_tool_call(
+    conversation_id: str,
+    turn_index: int,
+    tool_name: str,
+    iteration_number: int,
+    call_index: int,
+    latency_ms: float,
+    is_error: bool,
+) -> None:
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO tool_calls (conversation_id, turn_index, tool_name, "
+            "iteration_number, call_index, latency_ms, is_error) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (conversation_id, turn_index, tool_name, iteration_number,
+             call_index, latency_ms, 1 if is_error else 0),
+        )
+        conn.commit()
+    finally:
+        conn.close()
