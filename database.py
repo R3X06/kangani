@@ -614,6 +614,17 @@ def init_db() -> None:
         _migrate_notes_general(conn)
         conn.executescript(_INDEXES)
         conn.executescript(_RETRIEVAL_SCHEMA)
+        # Semantic half of retrieval: one L2-normalized little-endian float32
+        # vector per chunk, encoded by embedding.encode_vector. Additive rather
+        # than part of _RETRIEVAL_SCHEMA above, for the same reason as `turns`
+        # below -- CREATE TABLE IF NOT EXISTS is a no-op once note_chunks
+        # exists, so an existing DB would never see the column.
+        #
+        # Nullable on purpose, and NULL is a steady state rather than a
+        # migration artifact: chunks written while the embedder is switched
+        # off, uninstalled, or unable to load keep their BM25 rank and are
+        # simply absent from the cosine ranking until a backfill fills them in.
+        _ensure_column(conn, "note_chunks", "embedding", "BLOB")
         # Indexes notes that predate the retrieval layer. Idempotent -- only
         # touches notes with no chunks, so every run after the first is a
         # no-op, same contract as _backfill_tags above.
