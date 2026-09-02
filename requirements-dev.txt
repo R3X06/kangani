@@ -1,0 +1,27 @@
+# Development, test and evaluation dependencies.
+#
+# Kept out of requirements.txt, which is what the Docker image installs -- none
+# of this ships to the bot. Install both files to work on the repo:
+#
+#     pip install -r requirements.txt -r requirements-dev.txt
+#
+# Before this file existed the eval suite could not be installed from a fresh
+# clone at all: run.py imports yaml and analysis.ipynb imports the scientific
+# stack, and none of it appeared in any requirements file.
+
+# --- test and lint -------------------------------------------------------
+pytest>=8.0
+ruff>=0.16
+
+# --- eval harness --------------------------------------------------------
+# eval/run.py reads eval/prompts.yaml.
+PyYAML>=6.0
+
+# --- eval/analysis.ipynb -------------------------------------------------
+# Notebook only. Not imported by run.py, seed.py or report.py, so CI installs
+# these without using them; they are here so a fresh clone can open the
+# notebook.
+pandas>=2.0
+numpy>=1.26
+matplotlib>=3.8
+scikit-learn>=1.4

@@ -2,8 +2,9 @@
 
 import logging
 import os
-from datetime import date, datetime, time as dtime, timedelta, timezone
-from typing import Callable
+from collections.abc import Callable
+from datetime import date, datetime, timedelta, timezone
+from datetime import time as dtime
 from zoneinfo import ZoneInfo
 
 import database
@@ -1657,7 +1658,7 @@ def _handle_create_topic(tool_input: dict, chat_id: int, job_queue) -> str:
     schedule_for = None
     if topic["created"] and topic.get("event_datetime"):
         schedule_for = topic["event_datetime"]
-    elif not topic["created"] and event_datetime and not topic.get("event_datetime"):
+    elif not topic["created"] and event_datetime and not topic.get("event_datetime"):  # noqa: SIM102 -- collapsing moves a DB write into the condition
         # Existing topic, no date yet, user is supplying one now: fill it in
         # (otherwise the date is silently dropped -- get_or_create_topic returns
         # the existing row untouched) and schedule against it, once.

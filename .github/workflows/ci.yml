@@ -1,0 +1,37 @@
+name: CI
+
+# Push to main only. Direct pushes are how this repo works, and a
+# pull_request trigger would advertise a review flow that does not exist.
+# No branch protection and no merge gate: an unclaimed gate is better than a
+# claimed one that never runs.
+on:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    name: lint + tests + fixtures
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Tests
+        run: pytest -q
+
+      # Every seed state must build into a real database. Kept in a script
+      # so it can be run and debugged locally rather than only by pushing.
+      - name: Seed fixtures build
+        run: python eval/smoke.py

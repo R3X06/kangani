@@ -28,6 +28,10 @@ ENV/
 *.log
 logs/
 
+# --- Tooling caches (ruff and pytest now run locally and in CI) ---
+.ruff_cache/
+.pytest_cache/
+
 # --- IDE / OS ---
 .vscode/
 .idea/

@@ -62,7 +62,10 @@ def _parse_custom_local_datetime(text: str) -> datetime | None:
     text = text.strip()
     for fmt, has_time in (("%Y-%m-%d %H:%M", True), ("%Y-%m-%d", False)):
         try:
-            naive = datetime.strptime(text, fmt)
+            # Deliberately naive. The user types local
+            # wall-clock time; both exits below attach the local zone before
+            # this value escapes the function.
+            naive = datetime.strptime(text, fmt)  # noqa: DTZ007
         except ValueError:
             continue
         if not has_time:

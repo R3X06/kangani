@@ -22,7 +22,6 @@ reproducibility while looking fine.
 """
 
 import argparse
-import os
 import random
 import sys
 from datetime import date, datetime, timedelta, timezone
@@ -30,8 +29,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import database  # noqa: E402
-import retrieval  # noqa: E402
+import database
 
 SEED = 20260901
 CHAT_ID = 999_000_001

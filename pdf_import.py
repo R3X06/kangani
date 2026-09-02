@@ -13,7 +13,6 @@ import asyncio
 import base64
 import html
 import io
-import json
 import logging
 import os
 import re
@@ -368,8 +367,6 @@ def match_topics_by_name(chat_id: int, text: str) -> list[dict]:
 
     # Shorthand decomposition: try every way of splitting the string into a
     # sequence of pieces that each match a topic nested under the previous.
-    by_id = {t["id"]: t for t in topics}
-
     def resolve(remaining: str, parent_id):
         # Try progressively longer prefixes as the next path piece.
         results = []
@@ -527,8 +524,6 @@ async def handle_pdf_import_reply(update: Update, context: ContextTypes.DEFAULT_
     the message (caller should NOT also route it to brain.get_response),
     False if there's nothing pending (caller proceeds normally).
     """
-    import database
-
     awaiting = context.chat_data.get("pdf_import_awaiting")
     if not awaiting:
         return False

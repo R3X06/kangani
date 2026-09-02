@@ -1,0 +1,27 @@
+# Lint configuration for Kangani.
+#
+# Ruff's default rule selection is kept as-is. The two ignores below are
+# deliberate patterns in this codebase, verified site by site rather than
+# assumed -- an ignore added without reading the findings is just a silenced
+# alarm.
+
+# Ruff parses .ipynb natively and rejects eval/analysis.ipynb's cell schema
+# before it lints a single line of Python. The notebook is an analysis
+# scratchpad, not shipped code, so it is excluded rather than reformatted.
+exclude = ["*.ipynb"]
+
+[lint]
+ignore = [
+    # ISC004 -- implicit string concatenation inside collection literals.
+    # Long tool descriptions, system-prompt text and eval fixtures are written
+    # as adjacent string literals inside list/tuple/dict literals. Every one of
+    # the 14 sites was checked individually: none is a missing comma. Six of
+    # them are the NEAR_DUPLICATE_PAIRS fixtures in eval/seed.py, which must
+    # stay byte-identical while retrieval changes are measured against them.
+    "ISC004",
+    # BLE001 -- blind `except Exception`. This is the intended posture, not an
+    # oversight: indexing a note must degrade rather than cost the user their
+    # note (see create_note in database.py), and the same contract applies to
+    # the tool-dispatch loop's synthesis-on-ceiling fallback.
+    "BLE001",
+]

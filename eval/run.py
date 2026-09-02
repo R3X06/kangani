@@ -115,7 +115,6 @@ class StubJobQueue:
     def run_once(self, callback=None, when=None, chat_id=None, data=None,
                  name=None, **kwargs):
         self.scheduled.append({"name": name, "when": str(when), "data": data})
-        return None
 
     def get_jobs_by_name(self, name):
         return []
