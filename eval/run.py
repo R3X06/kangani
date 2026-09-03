@@ -231,7 +231,7 @@ def drain_instrumentation(db_path: Path) -> dict:
 
 
 async def execute_one(
-    brain, database, prompt: dict, repeat: int, state: str, client: CachingClient
+    loop, database, prompt: dict, repeat: int, state: str, client: CachingClient
 ) -> dict:
     restore_fixture(state)
     database.DB_PATH = SCRATCH_PATH
@@ -267,7 +267,7 @@ async def execute_one(
             record["instrumentation"] = {"turns": [], "tool_calls": []}
             record["error"] = None
         else:
-            reply = await brain.get_response(
+            reply = await loop.get_response(
                 CHAT_ID, text, [], job_queue,
                 conversation_id=conversation_id, turn_index=1,
             )
@@ -339,12 +339,33 @@ async def run(args) -> Path:
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     suffix = f"_ceil{args.ceiling_iterations}" if args.ceiling else ""
+    if args.loop != "native":
+        suffix += f"_{args.loop}"
     run_dir = RUNS_DIR / f"{args.state}{suffix}_{run_id}"
     run_dir.mkdir(parents=True, exist_ok=True)
-    cache_dir = CACHE_DIR / (f"{args.state}{suffix}")
+    # Cache dir is keyed by state+ceiling only, NOT by loop: the two arms
+    # share it on purpose. The cache key is (slot, call index, payload hash),
+    # so a langgraph request that is byte-identical to the native one hits and
+    # costs nothing -- and a miss is the signal that the port's request payload
+    # drifted, which is exactly what a port should be checked for.
+    cache_key = f"{args.state}" + (
+        f"_ceil{args.ceiling_iterations}" if args.ceiling else ""
+    )
+    cache_dir = CACHE_DIR / cache_key
 
     client = CachingClient(brain._get_client(), cache_dir, args.replay)
     brain._get_client = lambda: client
+
+    # Both arms drive the SAME tool registry, the same system blocks and the
+    # same instrumentation -- only the control flow differs. graph_loop is
+    # imported here rather than at module scope so a native run never needs
+    # langgraph installed, and so the client patch above is already in place
+    # (graph_loop resolves it through brain._get_client on every call).
+    if args.loop == "langgraph":
+        import graph_loop
+        loop = graph_loop
+    else:
+        loop = brain
 
     prompts = load_prompts(args.state)
     results_path = run_dir / "results.jsonl"
@@ -360,7 +381,7 @@ async def run(args) -> Path:
         for prompt in prompts:
             for repeat in range(1, args.repeats + 1):
                 record = await execute_one(
-                    brain, database, prompt, repeat, args.state, client
+                    loop, database, prompt, repeat, args.state, client
                 )
                 fh.write(json.dumps(record, default=str) + "\n")
                 fh.flush()
@@ -391,6 +412,7 @@ async def run(args) -> Path:
         "ceiling_config": bool(args.ceiling),
         "max_tool_iterations": brain.MAX_TOOL_ITERATIONS,
         "model": brain.MODEL,
+        "loop": args.loop,
         "prompts": len(prompts),
         "executions": total,
         "cache_hits": client.hits,
@@ -420,6 +442,9 @@ def main() -> None:
     parser.add_argument("--ceiling-iterations", type=int, default=2)
     parser.add_argument("--replay", action="store_true",
                         help="fail rather than make any live API call")
+    parser.add_argument("--loop", choices=["native", "langgraph"],
+                        default="native",
+                        help="which dispatch loop implementation to drive")
     args = parser.parse_args()
     asyncio.run(run(args))
 

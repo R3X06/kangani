@@ -17,6 +17,12 @@ ruff>=0.16
 # eval/run.py reads eval/prompts.yaml.
 PyYAML>=6.0
 
+# graph_loop.py only -- the LangGraph port of the dispatch loop, which exists
+# to be benchmarked against the hand-written loop in brain.py. Deliberately NOT
+# in requirements.txt: bot.py never imports graph_loop, and shipping the
+# framework to the Docker image would imply a migration that hasn't happened.
+langgraph>=1.0
+
 # --- eval/analysis.ipynb -------------------------------------------------
 # Notebook only. Not imported by run.py, seed.py or report.py, so CI installs
 # these without using them; they are here so a fresh clone can open the
