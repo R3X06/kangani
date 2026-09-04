@@ -15,10 +15,11 @@ Datasets A (synthetic) and B (real) are reported in separate sections with
 separate sample sizes and are never summed.
 """
 
+import argparse
 import json
 import sqlite3
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -32,7 +33,26 @@ OUT_PATH = EVAL_DIR / "METRICS.md"
 MIN_LABELLED_FOR_REGRESSION = 40
 
 
-def load_runs() -> list[dict]:
+def loop_of(run: dict) -> str:
+    """Which dispatch loop produced this run.
+
+    Runs recorded before graph_loop.py existed have no `loop` key; they were
+    all the hand-written loop, so absence means native. Defaulting rather than
+    erroring keeps the five original runs readable.
+    """
+    return run["manifest"].get("loop") or "native"
+
+
+def load_runs(loop: str | None = "native") -> list[dict]:
+    """Load run artifacts, filtered to ONE loop implementation by default.
+
+    Filtering is the default, not an option, because every aggregate below
+    groups on `ceiling_config` alone. Handed both arms at once, section_routes
+    would fold 395 native and 395 langgraph executions into a single 790-row
+    and report a ceiling share belonging to neither -- the same shape as the
+    pre-load_dotenv error runs that produced plausible, meaningless numbers.
+    Pass loop=None only where mixing is the point (section_loop_comparison).
+    """
     runs = []
     for run_dir in sorted(RUNS_DIR.glob("*/")):
         results = run_dir / "results.jsonl"
@@ -44,7 +64,10 @@ def load_runs() -> list[dict]:
             json.loads(line)
             for line in results.read_text(encoding="utf-8").splitlines()
         ]
-        runs.append({"dir": run_dir, "manifest": manifest, "records": records})
+        run = {"dir": run_dir, "manifest": manifest, "records": records}
+        if loop is not None and loop_of(run) != loop:
+            continue
+        runs.append(run)
     return runs
 
 
@@ -348,10 +371,190 @@ def section_real(real: dict | None) -> str:
     return "\n".join(lines)
 
 
+
+def _pair_key(run: dict, rec: dict) -> tuple:
+    """Identifies one execution across implementations.
+
+    (state, ceiling, prompt, repeat) is enough because run.py restores the
+    fixture before every execution and the cache slot carries the repeat
+    index, so the same key names the same starting conditions in both arms.
+    """
+    return (
+        run["manifest"].get("state"),
+        bool(run["manifest"].get("ceiling_config")),
+        rec["prompt_id"],
+        rec["repeat"],
+    )
+
+
+def section_loop_comparison(all_runs: list[dict]) -> str:
+    """A/B the hand-written loop against the LangGraph port.
+
+    Paired per execution rather than compared in aggregate: two arms can agree
+    on every total while disagreeing on which prompts took which path, and an
+    aggregate-only comparison would call that a match.
+    """
+    by_loop: dict[str, list[dict]] = defaultdict(list)
+    for run in all_runs:
+        by_loop[loop_of(run)].append(run)
+
+    if len(by_loop) < 2 or "langgraph" not in by_loop:
+        return ""
+
+    lines = ["## A — Dispatch loop comparison (native vs LangGraph)", ""]
+    lines.append(
+        "Both arms drive the same tool registry, system blocks and "
+        "instrumentation; only the control flow differs. The LangGraph arm "
+        "carries the iteration ceiling as graph state routed into an explicit "
+        "synthesis node, because `recursion_limit` raises at the graph "
+        "boundary and discards the tool results already gathered instead of "
+        "answering from them."
+    )
+    lines.append("")
+
+    # --- provenance, including the fidelity signal -----------------------
+    rows = []
+    for loop in sorted(by_loop):
+        for run in by_loop[loop]:
+            m = run["manifest"]
+            rows.append([
+                loop,
+                m.get("state", "?"),
+                "yes" if m.get("ceiling_config") else "no",
+                m.get("max_tool_iterations", "?"),
+                len(run["records"]),
+                f"{m.get('cache_hits', 0)}/{m.get('cache_misses', 0)}",
+            ])
+    lines.append(table(
+        ["loop", "state", "ceiling cfg", "max_iter", "executions",
+         "cache hit/miss"],
+        rows,
+    ))
+    lines.append("")
+
+    replayed = all(
+        run["manifest"].get("cache_misses", 1) == 0
+        for run in by_loop["langgraph"]
+    )
+    if replayed:
+        lines.append(
+            "**Every LangGraph request was a cache hit.** Each one was "
+            "byte-identical to the native arm's request in the same slot at "
+            "the same call index, which is the strongest available evidence "
+            "that the port did not drift. Two consequences follow. The model "
+            "was held exactly fixed, so any behavioural agreement below is a "
+            "statement about control flow and not about the model. And the "
+            "responses were replayed from disk, so `api_ms` measures cache "
+            "reads: NO latency comparison can be drawn from these runs."
+        )
+        lines.append("")
+
+    # --- paired divergence ----------------------------------------------
+    indexed: dict[str, dict[tuple, dict]] = defaultdict(dict)
+    for loop, runs in by_loop.items():
+        for run in runs:
+            for rec in run["records"]:
+                indexed[loop][_pair_key(run, rec)] = rec
+
+    shared = sorted(set(indexed["native"]) & set(indexed["langgraph"]))
+    if not shared:
+        lines.append(
+            "No (state, ceiling, prompt, repeat) key appears in both arms, so "
+            "nothing is paired and no comparison is reported."
+        )
+        return "\n".join(lines)
+
+    route_diff, tool_diff = [], []
+    for key in shared:
+        a, b = indexed["native"][key], indexed["langgraph"][key]
+        if a["actual_route"] != b["actual_route"]:
+            route_diff.append((key, a["actual_route"], b["actual_route"]))
+        if a["actual_tools"] != b["actual_tools"]:
+            tool_diff.append((key, a["actual_tools"], b["actual_tools"]))
+
+    n = len(shared)
+    lines.append(table(
+        ["paired executions", "same termination", "same tool sequence"],
+        [[
+            n,
+            f"{n - len(route_diff)} ({100 * (n - len(route_diff)) / n:.1f}%)",
+            f"{n - len(tool_diff)} ({100 * (n - len(tool_diff)) / n:.1f}%)",
+        ]],
+    ))
+    lines.append("")
+
+    if route_diff:
+        lines.append("Executions terminating differently:")
+        lines.append("")
+        lines.append(table(
+            ["state", "ceiling", "prompt", "repeat", "native", "langgraph"],
+            [[k[0], "yes" if k[1] else "no", k[2], k[3], a, b]
+             for k, a, b in route_diff[:25]],
+        ))
+        if len(route_diff) > 25:
+            lines.append("")
+            lines.append(f"({len(route_diff) - 25} further rows omitted.)")
+        lines.append("")
+    if tool_diff and not route_diff:
+        lines.append(
+            f"{len(tool_diff)} execution(s) dispatched a different tool "
+            "sequence while terminating identically."
+        )
+        lines.append("")
+
+    # --- termination distribution, side by side --------------------------
+    rows = []
+    for loop in ("native", "langgraph"):
+        for run in by_loop[loop]:
+            counts = Counter(r["actual_route"] for r in run["records"])
+            rows.append([
+                loop,
+                run["manifest"].get("state", "?"),
+                "yes" if run["manifest"].get("ceiling_config") else "no",
+                len(run["records"]),
+                counts.get("answer", 0),
+                counts.get("button_route", 0),
+                counts.get("ceiling", 0),
+                counts.get("truncated", 0),
+                counts.get("error", 0),
+            ])
+    lines.append(table(
+        ["loop", "state", "ceiling cfg", "n", "answer", "button_route",
+         "ceiling", "truncated", "error"],
+        rows,
+    ))
+    return "\n".join(lines)
+
+
 def main() -> None:
-    runs = load_runs()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--loop", default="native",
+        help="report on runs from this dispatch loop only (default: native)",
+    )
+    parser.add_argument(
+        "--compare", action="store_true",
+        help="append a native-vs-LangGraph comparison section",
+    )
+    args = parser.parse_args()
+
+    runs = load_runs(loop=args.loop)
     if not runs:
-        raise SystemExit(f"No runs in {RUNS_DIR}. Run eval/run.py first.")
+        raise SystemExit(
+            f"No {args.loop} runs in {RUNS_DIR}. Run eval/run.py first."
+        )
+    # Excluding runs silently is how a report ends up describing less than the
+    # reader assumes. Say so on stderr, where it cannot be mistaken for part of
+    # the document.
+    excluded = [r for r in load_runs(loop=None) if loop_of(r) != args.loop]
+    if excluded:
+        other = sorted({loop_of(r) for r in excluded})
+        print(
+            f"note: excluding {len(excluded)} run(s) from {', '.join(other)} "
+            f"-- every section below describes the {args.loop} loop only."
+            + ("" if args.compare else " Pass --compare to A/B them."),
+            file=sys.stderr,
+        )
     real = load_real()
 
     parts = [
@@ -380,6 +583,16 @@ def main() -> None:
         section_real(real),
         "",
     ]
+    if args.compare:
+        section = section_loop_comparison(load_runs(loop=None))
+        if section:
+            parts.extend([section, ""])
+        else:
+            print(
+                "note: --compare given but no langgraph run found; "
+                "no comparison section written.",
+                file=sys.stderr,
+            )
     OUT_PATH.write_text("\n".join(parts), encoding="utf-8")
     print(f"wrote {OUT_PATH} ({len(runs)} runs, "
           f"{sum(len(r['records']) for r in runs)} executions)")
